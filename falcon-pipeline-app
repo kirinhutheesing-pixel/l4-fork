@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export HOME="$SCRIPT_DIR"
+mkdir -p "$HOME/.streamlit"
+
+exec "$SCRIPT_DIR/.venv/bin/streamlit" run "$SCRIPT_DIR/falcon_pipeline_app.py" \
+  --server.port 8501 \
+  --server.address 127.0.0.1 \
+  --server.headless true \
+  --browser.gatherUsageStats false
