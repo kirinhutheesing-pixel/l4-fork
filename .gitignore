@@ -1,6 +1,11 @@
-*.pyc
+.pyc
 outputs*/
 *.egg-info/
-*.DS_Store
 dist/
 build/
+.DS_Store
+.cache/
+.streamlit/
+.venv/
+__pycache__/
+outputs/
