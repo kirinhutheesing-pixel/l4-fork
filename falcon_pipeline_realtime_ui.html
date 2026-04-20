@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Falcon Pipeline Realtime</title>
+  <style>
+    :root {
+      --ink: #ecf3ee;
+      --muted: #a9c0bc;
+      --line: rgba(236, 243, 238, 0.12);
+      --panel: rgba(15, 28, 30, 0.76);
+      --panel-strong: rgba(10, 20, 22, 0.88);
+      --teal: #53c0b6;
+      --teal-deep: #0f8b83;
+      --sand: #e7cb8d;
+      --coral: #ef8a5d;
+      --danger: #f16a5b;
+      --shadow: 0 26px 60px rgba(2, 8, 8, 0.35);
+      --radius-xl: 30px;
+      --radius-lg: 22px;
+      --radius-md: 16px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(239, 138, 93, 0.22), transparent 24%),
+        radial-gradient(circle at top right, rgba(83, 192, 182, 0.14), transparent 30%),
+        linear-gradient(180deg, #0d1c20 0%, #13282b 42%, #0b1719 100%);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+    }
+
+    .shell {
+      width: min(1440px, calc(100vw - 32px));
+      margin: 20px auto;
+      display: grid;
+      gap: 20px;
+    }
+
+    .hero {
+      padding: 24px 28px;
+      border-radius: var(--radius-xl);
+      border: 1px solid var(--line);
+      background:
+        linear-gradient(140deg, rgba(255, 255, 255, 0.04), rgba(83, 192, 182, 0.08)),
+        rgba(9, 18, 19, 0.78);
+      box-shadow: var(--shadow);
+    }
+
+    .eyebrow {
+      margin: 0 0 12px 0;
+      color: var(--sand);
+      font-size: 12px;
+      letter-spacing: 0.24em;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(2.2rem, 5vw, 4rem);
+      line-height: 0.95;
+      font-family: "Iowan Old Style", "Palatino Linotype", serif;
+      letter-spacing: -0.03em;
+    }
+
+    .hero p {
+      margin: 16px 0 0 0;
+      max-width: 72ch;
+      color: var(--muted);
+      font-size: 1.02rem;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.6fr) minmax(360px, 0.95fr);
+      gap: 20px;
+    }
+
+    .panel {
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--line);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel-header {
+      padding: 18px 22px 14px 22px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(83, 192, 182, 0.08), rgba(0, 0, 0, 0));
+    }
+
+    .panel-header h2 {
+      margin: 0;
+      font-size: 1.1rem;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      letter-spacing: 0.02em;
+    }
+
+    .video-wrap {
+      position: relative;
+      background: #081214;
+      aspect-ratio: 16 / 9;
+    }
+
+    .video-wrap img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      background: #081214;
+    }
+
+    .video-badge {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      border: 1px solid rgba(236, 243, 238, 0.12);
+      background: rgba(9, 19, 21, 0.7);
+      font-size: 0.86rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      padding: 16px 18px 18px 18px;
+    }
+
+    .metric {
+      border-radius: var(--radius-md);
+      padding: 16px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(236, 243, 238, 0.08);
+    }
+
+    .metric .label {
+      color: var(--muted);
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .metric .value {
+      margin-top: 8px;
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: var(--ink);
+    }
+
+    .control-grid {
+      display: grid;
+      gap: 14px;
+      padding: 18px 22px 22px 22px;
+    }
+
+    .field {
+      display: grid;
+      gap: 8px;
+    }
+
+    .field label {
+      color: var(--muted);
+      font-size: 0.86rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      font-weight: 700;
+    }
+
+    .field input,
+    .field select,
+    .field textarea {
+      width: 100%;
+      border: 1px solid rgba(236, 243, 238, 0.12);
+      border-radius: 16px;
+      background: rgba(7, 14, 15, 0.82);
+      color: var(--ink);
+      padding: 14px 16px;
+      font: inherit;
+      resize: vertical;
+    }
+
+    .field textarea {
+      min-height: 120px;
+    }
+
+    .dual {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .toggle {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 16px;
+      border-radius: 16px;
+      border: 1px solid rgba(236, 243, 238, 0.1);
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .toggle input {
+      width: 18px;
+      height: 18px;
+      accent-color: var(--coral);
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding-top: 4px;
+    }
+
+    button {
+      border: none;
+      border-radius: 999px;
+      padding: 14px 18px;
+      font: inherit;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      cursor: pointer;
+      transition: transform 120ms ease, filter 120ms ease;
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+      filter: brightness(1.04);
+    }
+
+    .primary {
+      color: #fff8f0;
+      background: linear-gradient(135deg, var(--coral), #ffb16e);
+      box-shadow: 0 18px 30px rgba(239, 138, 93, 0.24);
+    }
+
+    .secondary {
+      color: var(--ink);
+      background: linear-gradient(135deg, rgba(83, 192, 182, 0.9), rgba(132, 223, 214, 0.92));
+      box-shadow: 0 18px 30px rgba(83, 192, 182, 0.18);
+    }
+
+    .notes {
+      padding: 0 22px 22px 22px;
+      color: var(--muted);
+      font-size: 0.95rem;
+      line-height: 1.6;
+    }
+
+    .insight-list,
+    .detection-list {
+      display: grid;
+      gap: 12px;
+      padding: 18px 22px 22px 22px;
+    }
+
+    .insight,
+    .detection {
+      border-radius: 16px;
+      padding: 14px 16px;
+      border: 1px solid rgba(236, 243, 238, 0.08);
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .insight strong,
+    .detection strong {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--sand);
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .status-line {
+      padding: 0 22px 18px 22px;
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.5;
+    }
+
+    @media (max-width: 1100px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 700px) {
+      .shell {
+        width: min(100vw - 18px, 1440px);
+        margin: 10px auto 18px auto;
+      }
+
+      .metrics {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .dual {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <p class="eyebrow">Realtime CUDA Build</p>
+      <h1>Falcon Pipeline</h1>
+      <p>This interface is designed for a Google Cloud L4 deployment: RT-DETR carries the per-frame backbone, SAM 3 refines masks when enabled, and Falcon Perception acts as the natural-language orchestration layer behind the prompt box.</p>
+    </section>
+
+    <div class="grid">
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Live Overlay</h2>
+        </div>
+        <div class="video-wrap">
+          <img id="liveStream" src="/api/stream.mjpg" alt="Falcon Pipeline realtime stream">
+          <div class="video-badge" id="videoBadge">Waiting for telemetry</div>
+        </div>
+        <div class="metrics">
+          <div class="metric">
+            <div class="label">Primary Engine</div>
+            <div class="value" id="metricEngine">...</div>
+          </div>
+          <div class="metric">
+            <div class="label">Objects</div>
+            <div class="value" id="metricCount">0</div>
+          </div>
+          <div class="metric">
+            <div class="label">Latency</div>
+            <div class="value" id="metricLatency">...</div>
+          </div>
+          <div class="metric">
+            <div class="label">Processed FPS</div>
+            <div class="value" id="metricFps">0.00</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Mission Control</h2>
+        </div>
+        <form class="control-grid" id="sessionForm">
+          <div class="field">
+            <label for="sourceUrl">Livestream URL</label>
+            <input id="sourceUrl" name="source_url" type="url" placeholder="https://www.youtube.com/watch?v=...">
+          </div>
+
+          <div class="field">
+            <label for="prompt">Prompt Falcon Perception</label>
+            <textarea id="prompt" name="prompt" placeholder="people under the blue umbrellas on the left"></textarea>
+          </div>
+
+          <div class="dual">
+            <div class="field">
+              <label for="task">Mode</label>
+              <select id="task" name="task">
+                <option value="detection">Detection</option>
+                <option value="segmentation">Segmentation</option>
+              </select>
+            </div>
+            <div class="toggle">
+              <input id="enableSam3" name="enable_sam3" type="checkbox">
+              <label for="enableSam3">Use SAM 3 for live mask refinement</label>
+            </div>
+          </div>
+
+          <div class="dual">
+            <div class="field">
+              <label for="maxDim">Frame Max Dimension</label>
+              <input id="maxDim" name="max_dim" type="number" min="256" step="32" value="960">
+            </div>
+            <div class="field">
+              <label for="falconRefresh">Falcon Refresh Seconds</label>
+              <input id="falconRefresh" name="falcon_refresh_seconds" type="number" min="0.2" step="0.1" value="2.0">
+            </div>
+          </div>
+
+          <div class="actions">
+            <button class="primary" type="submit">Start Or Update Stream</button>
+            <button class="secondary" type="button" id="applyPromptOnly">Apply Prompt Only</button>
+          </div>
+        </form>
+        <div class="notes">
+          This service keeps the video feed continuous in the browser and drops stale frames internally so the GPU always works on the freshest view instead of walking through a backlog.
+        </div>
+        <div class="status-line" id="statusLine">Loading runtime state...</div>
+      </section>
+    </div>
+
+    <div class="grid">
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Prompting Guide</h2>
+        </div>
+        <div class="insight-list" id="guidelineList"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Current Detections</h2>
+        </div>
+        <div class="detection-list" id="detectionList">
+          <div class="detection">
+            <strong>No detections yet</strong>
+            <span class="muted">Start a stream and apply a focused prompt to populate the live results panel.</span>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById("sessionForm");
+    const applyPromptOnly = document.getElementById("applyPromptOnly");
+
+    function metricText(value, fallback = "...") {
+      if (value === null || value === undefined || value === "") {
+        return fallback;
+      }
+      return String(value);
+    }
+
+    function renderGuidelines(guidelines) {
+      const container = document.getElementById("guidelineList");
+      container.innerHTML = "";
+      (guidelines || []).forEach((item) => {
+        const card = document.createElement("div");
+        card.className = "insight";
+        card.innerHTML = `
+          <strong>${item.title}</strong>
+          <div><span class="muted">Good:</span> ${item.good}</div>
+          <div><span class="muted">Avoid:</span> ${item.avoid}</div>
+        `;
+        container.appendChild(card);
+      });
+    }
+
+    function renderDetections(detections) {
+      const container = document.getElementById("detectionList");
+      container.innerHTML = "";
+      if (!detections || detections.length === 0) {
+        container.innerHTML = `
+          <div class="detection">
+            <strong>No detections yet</strong>
+            <span class="muted">Try a more direct referring expression like "people under the umbrellas" or "tables on the left side".</span>
+          </div>
+        `;
+        return;
+      }
+
+      detections.slice(0, 12).forEach((detection, index) => {
+        const supportingLabels = (detection.supporting_labels || []).join(", ");
+        const score = detection.score === null || detection.score === undefined ? "" : ` | score ${Number(detection.score).toFixed(2)}`;
+        const detail = supportingLabels ? ` | support ${supportingLabels}` : "";
+        const card = document.createElement("div");
+        card.className = "detection";
+        card.innerHTML = `
+          <strong>${index + 1}. ${detection.label || "match"}</strong>
+          <div class="muted">${detection.engine || "pipeline"}${score}${detail}</div>
+        `;
+        container.appendChild(card);
+      });
+    }
+
+    function applyState(state) {
+      const session = state.session || {};
+      const metrics = state.metrics || {};
+      const result = state.result || {};
+      const detections = result.detections || [];
+      const primaryEngine = (result.primary_engine || "warming").replaceAll("_", "-").toUpperCase();
+
+      document.getElementById("sourceUrl").value = session.source_url || "";
+      document.getElementById("prompt").value = session.prompt || "";
+      document.getElementById("task").value = session.task || "detection";
+      document.getElementById("enableSam3").checked = Boolean(session.enable_sam3);
+      document.getElementById("maxDim").value = session.max_dim || 960;
+      document.getElementById("falconRefresh").value = session.falcon_refresh_seconds || 2.0;
+
+      document.getElementById("metricEngine").textContent = primaryEngine;
+      document.getElementById("metricCount").textContent = metricText(detections.length, "0");
+      document.getElementById("metricLatency").textContent = result.generation_seconds ? `${Number(result.generation_seconds).toFixed(2)}s` : "...";
+      document.getElementById("metricFps").textContent = metrics.processed_fps ? Number(metrics.processed_fps).toFixed(2) : "0.00";
+      document.getElementById("videoBadge").textContent = `${metricText(metrics.capture_state, "idle")} / ${metricText(metrics.pipeline_state, "warming_up")}`;
+
+      const streamTitle = state.stream && (state.stream.title || state.stream.requested_url) ? `Source: ${state.stream.title || state.stream.requested_url}` : "Source: not connected yet";
+      const errorLine = metrics.last_error ? ` | Alert: ${metrics.last_error}` : "";
+      const sam3Line = state.sam3_available ? "SAM 3 ready" : (state.sam3_load_error ? `SAM 3 unavailable: ${state.sam3_load_error}` : "SAM 3 not loaded");
+      document.getElementById("statusLine").textContent = `${streamTitle} | ${sam3Line}${errorLine}`;
+
+      renderGuidelines(state.guidelines || []);
+      renderDetections(detections);
+    }
+
+    async function fetchState() {
+      const response = await fetch("/api/state", { cache: "no-store" });
+      const state = await response.json();
+      applyState(state);
+    }
+
+    async function sendUpdate(payload) {
+      const response = await fetch("/api/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const state = await response.json();
+      applyState(state);
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      await sendUpdate({
+        source_url: document.getElementById("sourceUrl").value.trim(),
+        prompt: document.getElementById("prompt").value.trim(),
+        task: document.getElementById("task").value,
+        enable_sam3: document.getElementById("enableSam3").checked,
+        max_dim: Number(document.getElementById("maxDim").value),
+        falcon_refresh_seconds: Number(document.getElementById("falconRefresh").value),
+      });
+    });
+
+    applyPromptOnly.addEventListener("click", async () => {
+      await sendUpdate({
+        prompt: document.getElementById("prompt").value.trim(),
+        task: document.getElementById("task").value,
+        enable_sam3: document.getElementById("enableSam3").checked,
+        falcon_refresh_seconds: Number(document.getElementById("falconRefresh").value),
+      });
+    });
+
+    fetchState();
+    setInterval(fetchState, 1000);
+  </script>
+</body>
+</html>
