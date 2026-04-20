@@ -1,0 +1,7 @@
+.cache
+.streamlit
+.venv
+__pycache__
+outputs
+.DS_Store
+falcon-perception-main.tar.gz
