@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import platform
 import re
 import time
 from copy import deepcopy
@@ -104,6 +105,11 @@ def inspect_torch_stack() -> dict[str, Any]:
 def inspect_engine_capabilities(*, allow_experimental_sam3: bool = False) -> dict[str, dict[str, Any]]:
     torch_stack = inspect_torch_stack()
     base_reason = torch_stack["reason"]
+    falcon_device = (
+        "mlx"
+        if platform.system() == "Darwin" and platform.machine().lower() == "arm64"
+        else torch_stack["device"]
+    )
 
     rtdetr_available = (
         torch_stack["torch_available"]
@@ -127,7 +133,7 @@ def inspect_engine_capabilities(*, allow_experimental_sam3: bool = False) -> dic
     else:
         sam3_reason = (
             "Disabled by default on this device. The official SAM 3 repo targets CUDA GPUs, "
-            "and this Mac would need an experimental non-CUDA run."
+            "and non-CUDA runs are treated as experimental."
         )
 
     return {
@@ -136,7 +142,7 @@ def inspect_engine_capabilities(*, allow_experimental_sam3: bool = False) -> dic
             enabled=True,
             status="ready",
             available=True,
-            device="mlx",
+            device=falcon_device,
             reason=None,
             model_id=None,
         ),

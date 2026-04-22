@@ -5,26 +5,31 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     HF_HOME=/app/.cache/huggingface \
     HF_HUB_CACHE=/app/.cache/huggingface/hub \
-    HF_XET_CACHE=/app/.cache/huggingface/xet
+    HF_XET_CACHE=/app/.cache/huggingface/xet \
+    HF_HUB_DISABLE_XET=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=0 \
+    HF_HUB_DISABLE_SYMLINKS_WARNING=1
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-venv \
-    python3-pip \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     ffmpeg \
+    git \
     libgl1 \
     libglib2.0-0 \
-    git \
+    python3 \
+    python3-pip \
+    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . /app
 
-RUN python3 -m venv /app/.venv
-RUN /app/.venv/bin/pip install --upgrade pip setuptools wheel
-RUN /app/.venv/bin/pip install -r /app/requirements-gcp-l4.txt
-RUN chmod +x /app/falcon-pipeline-realtime /app/falcon-pipeline /app/falcon-pipeline-app /app/falcon-perception /app/falcon-perception-app || true
+RUN python3 -m venv /app/.venv \
+    && /app/.venv/bin/pip install --upgrade pip setuptools wheel \
+    && /app/.venv/bin/pip install -r /app/requirements-gcp-l4.txt \
+    && mkdir -p /app/.cache/huggingface /app/outputs/falcon-pipeline-realtime \
+    && chmod +x /app/falcon-pipeline-realtime /app/falcon-pipeline /app/falcon-pipeline-app
 
 EXPOSE 8080
 

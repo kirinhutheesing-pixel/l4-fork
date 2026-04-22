@@ -9,3 +9,5 @@ build/
 .venv/
 __pycache__/
 outputs/
+.tmp/
+.tmp-tests/

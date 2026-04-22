@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import time
 from pathlib import Path
 from typing import Any
@@ -46,7 +47,7 @@ PALETTE = [
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run Falcon Pipeline on Apple Silicon using the MLX backend. "
+            "Run Falcon Pipeline on a local image or livestream sample. "
             "Pass an image or livestream and a natural-language query to get detections and saved results."
         )
     )
@@ -76,10 +77,16 @@ def parse_args() -> argparse.Namespace:
         help="Load model weights from a local Hugging Face export instead of downloading them.",
     )
     parser.add_argument(
+        "--backend",
+        choices=("auto", "torch", "mlx"),
+        default="auto",
+        help="Inference backend. 'auto' uses MLX on Apple Silicon and torch everywhere else.",
+    )
+    parser.add_argument(
         "--dtype",
         choices=("float16", "bfloat16", "float32"),
         default="float16",
-        help="MLX dtype to use for inference.",
+        help="Model dtype to use for inference.",
     )
     parser.add_argument("--min-dim", type=int, default=256, help="Minimum resized image side.")
     parser.add_argument("--max-dim", type=int, default=1024, help="Maximum resized image side.")
@@ -184,6 +191,56 @@ def configure_huggingface_cache(cache_dir: Path) -> None:
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+
+def resolve_runtime_backend(requested_backend: str) -> str:
+    if requested_backend != "auto":
+        return requested_backend
+    if platform.system() == "Darwin" and platform.machine().lower() == "arm64":
+        return "mlx"
+    return "torch"
+
+
+def resolve_runtime_dtype(backend: str, requested_dtype: str) -> str:
+    if backend != "torch" or requested_dtype != "float16":
+        return requested_dtype
+
+    try:
+        import torch
+    except Exception:
+        return requested_dtype
+
+    if torch.cuda.is_available():
+        return requested_dtype
+
+    return "float32"
+
+
+def should_compile_model(backend: str) -> bool:
+    if backend != "torch":
+        return True
+
+    try:
+        import torch
+    except Exception:
+        return False
+
+    return bool(torch.cuda.is_available())
+
+
+def get_batch_inference_bindings(backend: str):
+    if backend == "mlx":
+        from falcon_perception.mlx.batch_inference import BatchInferenceEngine, process_batch_and_generate
+    else:
+        from falcon_perception.batch_inference import BatchInferenceEngine, process_batch_and_generate
+    return BatchInferenceEngine, process_batch_and_generate
+
+
+def decode_output_tokens(output_tokens: Any) -> list[int]:
+    first = output_tokens[0]
+    if hasattr(first, "detach"):
+        return first.detach().cpu().tolist()
+    return np.array(first).tolist()
 
 
 def pair_bbox_entries(raw_entries: list[dict]) -> list[dict]:
@@ -362,6 +419,7 @@ def read_frame_as_pil(capture: cv2.VideoCapture, timeout_seconds: float) -> Imag
 
 def run_inference_on_image(
     *,
+    backend: str,
     engine: Any,
     tokenizer: Any,
     model_args: Any,
@@ -373,8 +431,7 @@ def run_inference_on_image(
     max_new_tokens: int,
     temperature: float,
 ) -> dict[str, Any]:
-    from falcon_perception.mlx.batch_inference import process_batch_and_generate
-
+    _, process_batch_and_generate = get_batch_inference_bindings(backend)
     prompt = build_prompt_for_task(query, task)
     batch = process_batch_and_generate(
         tokenizer,
@@ -398,7 +455,7 @@ def run_inference_on_image(
     generation_seconds = time.perf_counter() - start
 
     decoded = summarize_decoded_output(
-        tokenizer.decode(np.array(output_tokens[0]).tolist(), skip_special_tokens=False)
+        tokenizer.decode(decode_output_tokens(output_tokens), skip_special_tokens=False)
     )
     aux = aux_outputs[0]
     bboxes = pair_bbox_entries(aux.bboxes_raw)
@@ -426,6 +483,7 @@ def run_inference_on_image(
 
 def run_orchestrated_inference_on_image(
     *,
+    backend: str,
     engine: Any,
     tokenizer: Any,
     model_args: Any,
@@ -450,6 +508,7 @@ def run_orchestrated_inference_on_image(
     sam3_mask_threshold: float = 0.5,
 ) -> dict[str, Any]:
     falcon_inference = run_inference_on_image(
+        backend=backend,
         engine=engine,
         tokenizer=tokenizer,
         model_args=model_args,
@@ -544,6 +603,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--query is required when --stream is provided.")
     if args.stream_max_samples < 1:
         raise SystemExit("--stream-max-samples must be at least 1.")
+    if args.backend == "mlx" and not (
+        platform.system() == "Darwin" and platform.machine().lower() == "arm64"
+    ):
+        raise SystemExit("--backend mlx requires Apple Silicon. Use --backend torch or --backend auto.")
 
 
 def build_static_result(
@@ -563,6 +626,7 @@ def build_static_result(
         "query": query,
         "task": args.task,
         "model_id": args.model_id,
+        "backend": args.backend,
         "dtype": args.dtype,
         "image_size": {"width": image.size[0], "height": image.size[1]},
         "timing_seconds": {"generation": inference["generation_seconds"]},
@@ -590,6 +654,7 @@ def build_stream_result(
         "query": query,
         "task": args.task,
         "model_id": args.model_id,
+        "backend": args.backend,
         "dtype": args.dtype,
         "orchestrator": "falcon",
         "enabled_engines": {
@@ -615,21 +680,28 @@ def main() -> int:
     configure_huggingface_cache(args.cache_dir)
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    backend = resolve_runtime_backend(args.backend)
+    effective_dtype = resolve_runtime_dtype(backend, args.dtype)
+    compile_model = should_compile_model(backend)
+    args.backend = backend
+    args.dtype = effective_dtype
 
-    print("Loading Falcon Pipeline...")
+    print(f"Loading Falcon Pipeline (backend={backend}, dtype={effective_dtype})...")
+    if backend == "torch" and not compile_model:
+        print("Torch compile disabled for this runtime.")
     model, tokenizer, model_args = load_and_prepare_model(
         hf_model_id=args.model_id,
         hf_local_dir=args.local_model_dir,
-        dtype=args.dtype,
-        backend="mlx",
+        dtype=effective_dtype,
+        backend=backend,
+        compile=compile_model,
     )
 
     if args.task == "segmentation" and not model_args.do_segmentation:
         print("Selected model does not support segmentation; switching to detection.")
         args.task = "detection"
 
-    from falcon_perception.mlx.batch_inference import BatchInferenceEngine
-
+    BatchInferenceEngine, _ = get_batch_inference_bindings(backend)
     engine = BatchInferenceEngine(model, tokenizer)
     rtdetr_runtime: dict[str, Any] | None = None
     sam3_runtime: dict[str, Any] | None = None
@@ -667,6 +739,7 @@ def main() -> int:
             for sample_index in range(args.stream_max_samples):
                 image = read_frame_as_pil(capture, args.stream_read_timeout).convert("RGB")
                 inference = run_orchestrated_inference_on_image(
+                    backend=backend,
                     engine=engine,
                     tokenizer=tokenizer,
                     model_args=model_args,
@@ -739,6 +812,7 @@ def main() -> int:
 
     image, query, input_label = resolve_static_input(args)
     inference = run_orchestrated_inference_on_image(
+        backend=backend,
         engine=engine,
         tokenizer=tokenizer,
         model_args=model_args,

@@ -72,6 +72,9 @@ dev = [
     "matplotlib>=3.10.8",
 ]
 server = [
+    "transformers>=4.57.3",
+    "accelerate>=1.10.0",
+    "yt-dlp>=2025.03.31",
     "fastapi>=0.129.0",
     "uvicorn[standard]>=0.40.0",
     "python-multipart>=0.0.22",

@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +22,7 @@ if FALCON_SOURCE_ROOT.exists() and str(FALCON_SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(FALCON_SOURCE_ROOT))
 
 from falcon_perception import (  # noqa: E402
-    PERCEPTION_MODEL_ID,
+    PERCEPTION_300M_MODEL_ID,
     build_prompt_for_task,
     load_and_prepare_model,
     setup_torch_config,
@@ -175,13 +175,14 @@ class LiveSessionConfig:
 class RuntimeOptions:
     cache_dir: Path
     output_dir: Path
-    falcon_model_id: str = PERCEPTION_MODEL_ID
+    falcon_model_id: str = PERCEPTION_300M_MODEL_ID
     rtdetr_model_id: str = DEFAULT_RT_DETR_MODEL_ID
     sam3_model_id: str = DEFAULT_SAM3_MODEL_ID
     dtype: str = "bfloat16"
     device: str = "cuda"
     compile_model: bool = True
-    load_sam3: bool = True
+    load_rtdetr: bool = True
+    load_sam3: bool = False
     host: str = "0.0.0.0"
     port: int = 8080
     ui_path: Path = DEFAULT_UI_PATH
@@ -295,7 +296,9 @@ class FalconPipelineRealtimeService:
         self.latest_frame_id = 0
         self.prompt_revision = 0
         self.latest_result: dict[str, Any] = {}
-        self.latest_jpeg: bytes = placeholder_frame("Waiting for a stream source.")
+        self.latest_jpeg: bytes = b""
+        self.latest_frame_is_placeholder = True
+        self.latest_frame_note = "Waiting for a stream source."
         self.latest_metrics: dict[str, Any] = {
             "capture_state": "idle",
             "pipeline_state": "warming_up",
@@ -306,29 +309,39 @@ class FalconPipelineRealtimeService:
         }
         self.processed_timestamps: deque[float] = deque(maxlen=40)
         self.falcon_runtime: FalconRealtimeRuntime | None = None
+        self.falcon_load_error: str | None = None
         self.rtdetr_runtime: dict[str, Any] | None = None
+        self.rtdetr_load_error: str | None = None
         self.sam3_runtime: dict[str, Any] | None = None
         self.sam3_load_error: str | None = None
+        self.model_status: dict[str, dict[str, Any]] = {
+            "falcon": {
+                "requested": True,
+                "state": "pending",
+                "error": None,
+            },
+            "rt_detr": {
+                "requested": self.options.load_rtdetr,
+                "state": "pending" if self.options.load_rtdetr else "disabled",
+                "error": None,
+            },
+            "sam3": {
+                "requested": self.options.load_sam3,
+                "state": "pending" if self.options.load_sam3 else "disabled",
+                "error": None,
+            },
+        }
         self.threads: list[threading.Thread] = []
+        self._set_placeholder_frame("Waiting for a stream source.", clear_result=True)
 
     def start(self) -> None:
         configure_huggingface_cache(self.options.cache_dir)
         self.options.output_dir.mkdir(parents=True, exist_ok=True)
         self._set_metric("pipeline_state", "loading_models")
-        self.falcon_runtime = FalconRealtimeRuntime(self.options)
-        self.rtdetr_runtime = load_rtdetr_runtime(self.options.rtdetr_model_id)
-        if self.options.load_sam3:
-            try:
-                self.sam3_runtime = load_sam3_runtime(
-                    self.options.sam3_model_id,
-                    allow_experimental_non_cuda=False,
-                )
-            except Exception as exc:
-                self.sam3_runtime = None
-                self.sam3_load_error = str(exc)
-        self._set_metric("pipeline_state", "waiting_for_source")
+        self._set_placeholder_frame("Loading models.", clear_result=True)
 
         self.threads = [
+            threading.Thread(target=self._load_models, name="falcon-loader", daemon=True),
             threading.Thread(target=self._capture_loop, name="falcon-capture", daemon=True),
             threading.Thread(target=self._process_loop, name="falcon-process", daemon=True),
         ]
@@ -345,6 +358,107 @@ class FalconPipelineRealtimeService:
     def _set_metric(self, key: str, value: Any) -> None:
         with self.lock:
             self.latest_metrics[key] = value
+
+    def _set_model_state(self, name: str, state: str, error: str | None = None) -> None:
+        with self.lock:
+            record = self.model_status[name]
+            record["state"] = state
+            record["error"] = error
+
+    def _set_placeholder_frame(self, message: str, *, clear_result: bool = False) -> None:
+        payload = placeholder_frame(message)
+        with self.lock:
+            self.latest_jpeg = payload
+            self.latest_frame_is_placeholder = True
+            self.latest_frame_note = message
+            if clear_result:
+                self.latest_result = {}
+
+    def _mark_live_frame(self) -> None:
+        with self.lock:
+            self.latest_frame_is_placeholder = False
+            self.latest_frame_note = None
+
+    def _models_ready(self, model_status: dict[str, dict[str, Any]]) -> bool:
+        for record in model_status.values():
+            if record["state"] not in {"loaded", "disabled"}:
+                return False
+        return True
+
+    def _derive_service_state(
+        self,
+        *,
+        session: dict[str, Any],
+        metrics: dict[str, Any],
+        model_status: dict[str, dict[str, Any]],
+        frame: dict[str, Any],
+    ) -> str:
+        if model_status["falcon"]["state"] == "error" or metrics.get("pipeline_state") == "error":
+            return "error"
+        if metrics.get("capture_state") == "error":
+            return "error"
+        if not self._models_ready(model_status):
+            return "warming"
+        if not session.get("source_url", "").strip():
+            return "idle"
+        if metrics.get("capture_state") in {"connecting", "reconnecting"}:
+            return "connecting"
+        degraded = model_status["rt_detr"]["state"] == "error" or (
+            bool(session.get("enable_sam3")) and model_status["sam3"]["state"] == "error"
+        )
+        if frame["ready"]:
+            return "degraded" if degraded else "live"
+        return "waiting_for_frame"
+
+    def _load_models(self) -> None:
+        self._set_metric("pipeline_state", "loading_models")
+        self._set_metric("last_error", None)
+
+        self._set_model_state("falcon", "loading")
+        try:
+            self.falcon_runtime = FalconRealtimeRuntime(self.options)
+        except Exception as exc:
+            self.falcon_runtime = None
+            self.falcon_load_error = str(exc)
+            self._set_model_state("falcon", "error", self.falcon_load_error)
+            self._set_metric("pipeline_state", "error")
+            self._set_metric("last_error", f"Falcon load failed: {exc}")
+            self._set_placeholder_frame(f"Falcon load failed: {exc}", clear_result=True)
+            return
+        self._set_model_state("falcon", "loaded")
+
+        if self.options.load_rtdetr:
+            self._set_model_state("rt_detr", "loading")
+            try:
+                self.rtdetr_runtime = load_rtdetr_runtime(self.options.rtdetr_model_id)
+            except Exception as exc:
+                self.rtdetr_runtime = None
+                self.rtdetr_load_error = str(exc)
+                self._set_model_state("rt_detr", "error", self.rtdetr_load_error)
+            else:
+                self._set_model_state("rt_detr", "loaded")
+
+        if self.options.load_sam3:
+            self._set_model_state("sam3", "loading")
+            try:
+                self.sam3_runtime = load_sam3_runtime(
+                    self.options.sam3_model_id,
+                    allow_experimental_non_cuda=False,
+                )
+            except Exception as exc:
+                self.sam3_runtime = None
+                self.sam3_load_error = str(exc)
+                self._set_model_state("sam3", "error", self.sam3_load_error)
+            else:
+                self._set_model_state("sam3", "loaded")
+
+        session = self._session_copy()
+        if session.source_url.strip():
+            self._set_metric("pipeline_state", "waiting_for_frame")
+            self._set_placeholder_frame("Models loaded. Waiting for first live frame.", clear_result=True)
+        else:
+            self._set_metric("pipeline_state", "waiting_for_source")
+            self._set_placeholder_frame("Waiting for a stream source.", clear_result=True)
 
     def _session_copy(self) -> LiveSessionConfig:
         with self.lock:
@@ -368,9 +482,18 @@ class FalconPipelineRealtimeService:
             if source_changed:
                 self.prompt_revision += 1
                 self.capture_source_key = None
+                self.stream_info = None
                 self.latest_frame = None
+                self.latest_result = {}
                 self.latest_metrics["capture_state"] = "reconnecting"
-                self.latest_jpeg = placeholder_frame("Switching stream source.")
+                self.latest_metrics["pipeline_state"] = "waiting_for_source"
+                self.latest_metrics["last_processed_at"] = None
+                self.latest_metrics["latest_generation_seconds"] = None
+                self.latest_metrics["processed_fps"] = 0.0
+                self.latest_frame_is_placeholder = True
+                self.latest_frame_note = "Switching stream source."
+            if source_changed:
+                self._set_placeholder_frame("Switching stream source.", clear_result=True)
         return self.get_state()
 
     def get_state(self) -> dict[str, Any]:
@@ -379,14 +502,41 @@ class FalconPipelineRealtimeService:
             metrics = copy.deepcopy(self.latest_metrics)
             session = copy.deepcopy(asdict(self.session))
             stream = copy.deepcopy(self.stream_info)
+            model_status = copy.deepcopy(self.model_status)
+            frame = {
+                "state": "placeholder" if self.latest_frame_is_placeholder else "live",
+                "is_placeholder": self.latest_frame_is_placeholder,
+                "ready": not self.latest_frame_is_placeholder,
+                "capture_has_frame": self.latest_frame is not None,
+                "note": self.latest_frame_note,
+                "bytes": len(self.latest_jpeg),
+            }
+        readiness = {
+            "service_state": self._derive_service_state(
+                session=session,
+                metrics=metrics,
+                model_status=model_status,
+                frame=frame,
+            ),
+            "models_ready": self._models_ready(model_status),
+            "capture_connected": metrics.get("capture_state") == "running",
+            "integration_ready": self._models_ready(model_status) and frame["ready"],
+        }
         return {
             "session": session,
             "metrics": metrics,
             "stream": stream,
             "result": result,
+            "frame": frame,
+            "readiness": readiness,
             "guidelines": PROMPT_GUIDELINES,
+            "falcon_available": self.falcon_runtime is not None,
+            "falcon_load_error": self.falcon_load_error,
+            "rtdetr_available": self.rtdetr_runtime is not None,
+            "rtdetr_load_error": self.rtdetr_load_error,
             "sam3_available": self.sam3_runtime is not None,
             "sam3_load_error": self.sam3_load_error,
+            "model_status": model_status,
             "models": {
                 "falcon": self.options.falcon_model_id,
                 "rt_detr": self.options.rtdetr_model_id,
@@ -401,6 +551,11 @@ class FalconPipelineRealtimeService:
             self.latest_metrics["pipeline_state"] = "running"
             self.latest_metrics["latest_generation_seconds"] = result.get("generation_seconds")
             self.latest_metrics["last_processed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        self._mark_live_frame()
+
+    def get_latest_jpeg(self) -> bytes:
+        with self.lock:
+            return bytes(self.latest_jpeg)
 
     def _open_capture(self, source_url: str, timeout_seconds: float) -> tuple[cv2.VideoCapture, dict[str, Any]]:
         stream_info = resolve_stream_source(source_url)
@@ -426,7 +581,7 @@ class FalconPipelineRealtimeService:
                 except Exception as exc:
                     self._set_metric("capture_state", "error")
                     self._set_metric("last_error", f"Stream connect failed: {exc}")
-                    self.latest_jpeg = placeholder_frame(str(exc))
+                    self._set_placeholder_frame(str(exc), clear_result=True)
                     time.sleep(2.0)
                     continue
 
@@ -475,6 +630,10 @@ class FalconPipelineRealtimeService:
                 session = copy.deepcopy(self.session)
 
             if frame is None or not session.source_url.strip():
+                time.sleep(0.05)
+                continue
+
+            if self.falcon_runtime is None:
                 time.sleep(0.05)
                 continue
 
@@ -532,14 +691,20 @@ class FalconPipelineRealtimeService:
                     }
                 )
 
-                assert self.rtdetr_runtime is not None
-                rtdetr_inference = run_rtdetr_inference(
-                    runtime=self.rtdetr_runtime,
-                    image=model_image,
-                    query=session.prompt,
-                    falcon_bboxes=falcon_inference.get("bboxes") or [],
-                    threshold=session.rtdetr_threshold,
-                )
+                rtdetr_inference = None
+                rtdetr_error = self.rtdetr_load_error
+                if self.rtdetr_runtime is not None:
+                    try:
+                        rtdetr_inference = run_rtdetr_inference(
+                            runtime=self.rtdetr_runtime,
+                            image=model_image,
+                            query=session.prompt,
+                            falcon_bboxes=falcon_inference.get("bboxes") or [],
+                            threshold=session.rtdetr_threshold,
+                        )
+                        rtdetr_error = None
+                    except Exception as exc:
+                        rtdetr_error = str(exc)
 
                 sam3_inference = None
                 sam3_error = self.sam3_load_error
@@ -576,7 +741,8 @@ class FalconPipelineRealtimeService:
                         )
                     ),
                     rtdetr_inference=rtdetr_inference,
-                    rtdetr_model_id=self.options.rtdetr_model_id,
+                    rtdetr_model_id=(self.options.rtdetr_model_id if self.options.load_rtdetr else None),
+                    rtdetr_error=rtdetr_error,
                     sam3_inference=sam3_inference,
                     sam3_model_id=(self.options.sam3_model_id if session.enable_sam3 else None),
                     sam3_error=sam3_error,
@@ -598,8 +764,7 @@ class FalconPipelineRealtimeService:
             except Exception as exc:
                 self._set_metric("pipeline_state", "error")
                 self._set_metric("last_error", f"Processing failed: {exc}")
-                with self.lock:
-                    self.latest_jpeg = placeholder_frame(f"Processing failed: {exc}")
+                self._set_placeholder_frame(f"Processing failed: {exc}")
                 time.sleep(0.25)
 
     def _render_overlay(
@@ -709,7 +874,7 @@ def load_ui_html(path: Path) -> str:
 
 def create_app(service: FalconPipelineRealtimeService, ui_html: str):
     from fastapi import FastAPI, Request
-    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
     app = FastAPI(title="Falcon Pipeline Realtime")
 
@@ -734,7 +899,6 @@ def create_app(service: FalconPipelineRealtimeService, ui_html: str):
             {
                 "status": "ok",
                 "service": "falcon-pipeline-realtime",
-                "metrics": service.get_state()["metrics"],
             }
         )
 
@@ -744,6 +908,10 @@ def create_app(service: FalconPipelineRealtimeService, ui_html: str):
             service.mjpeg_stream(),
             media_type="multipart/x-mixed-replace; boundary=frame",
         )
+
+    @app.get("/api/frame.jpg")
+    async def frame() -> Response:
+        return Response(content=service.get_latest_jpeg(), media_type="image/jpeg")
 
     return app
 
@@ -766,7 +934,7 @@ def parse_args() -> argparse.Namespace:
         help="Primary live task mode.",
     )
     parser.add_argument("--enable-sam3", action="store_true", help="Enable SAM 3 by default in the UI session.")
-    parser.add_argument("--falcon-model-id", default=PERCEPTION_MODEL_ID, help="Falcon Perception model id.")
+    parser.add_argument("--falcon-model-id", default=PERCEPTION_300M_MODEL_ID, help="Falcon Perception model id.")
     parser.add_argument("--rtdetr-model-id", default=DEFAULT_RT_DETR_MODEL_ID, help="RT-DETR model id.")
     parser.add_argument("--sam3-model-id", default=DEFAULT_SAM3_MODEL_ID, help="SAM 3 model id.")
     parser.add_argument(
@@ -780,7 +948,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Artifact output directory.")
     parser.add_argument("--ui-path", type=Path, default=DEFAULT_UI_PATH, help="HTML UI file to serve.")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile for Falcon.")
-    parser.add_argument("--no-load-sam3", action="store_true", help="Skip loading SAM 3 at startup.")
+    parser.add_argument("--no-load-rtdetr", action="store_true", help="Skip loading RT-DETR at startup.")
+    sam3_group = parser.add_mutually_exclusive_group()
+    sam3_group.add_argument("--load-sam3", dest="load_sam3", action="store_true", help="Preload SAM 3 at startup.")
+    sam3_group.add_argument("--no-load-sam3", dest="load_sam3", action="store_false", help=argparse.SUPPRESS)
+    parser.set_defaults(load_sam3=False)
     parser.add_argument("--min-dim", type=int, default=480, help="Shortest side used for live detector frames.")
     parser.add_argument("--max-dim", type=int, default=960, help="Longest side used for live detector frames.")
     parser.add_argument("--falcon-min-dim", type=int, default=256, help="Shortest side for Falcon refresh passes.")
@@ -803,7 +975,8 @@ def main() -> int:
         dtype=args.dtype,
         device=args.device,
         compile_model=not args.no_compile,
-        load_sam3=not args.no_load_sam3,
+        load_rtdetr=not args.no_load_rtdetr,
+        load_sam3=args.load_sam3,
         host=args.host,
         port=args.port,
         ui_path=args.ui_path.expanduser().resolve(),

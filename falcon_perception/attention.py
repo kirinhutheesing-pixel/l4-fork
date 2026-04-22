@@ -99,6 +99,9 @@ def get_image_prefix_mask_mod(
 @torch.inference_mode()
 def create_attention_mask(*args, **kwargs) -> BlockMask:
     """Compiled for performance; always runs under inference_mode to avoid grad_mode recompiles."""
+    device = kwargs.get("device")
+    if device is not None and torch.device(device).type != "cuda":
+        return create_block_mask(*args, **kwargs)
     return _compiled_create_block_mask(*args, **kwargs)
 
 
@@ -128,4 +131,4 @@ def create_batch_attention_mask(
     )
     mask_mod = or_masks(image_prefix_mask_mod, block_causal_mask_mod)
     max_len = max_len or S
-    return create_attention_mask(mask_mod, B, None, max_len, max_len)
+    return create_attention_mask(mask_mod, B, None, max_len, max_len, device=input_batch.device)

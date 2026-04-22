@@ -13,6 +13,7 @@ from torch import nn
 from torch.nn.attention.flex_attention import (
     AuxRequest,
     BlockMask,
+    flex_attention,
 )
 
 from falcon_perception import ModelArgs
@@ -153,7 +154,10 @@ class Attention(nn.Module):
         )
         # Decode (S_q == 1): static-shape compiled, CUDA-graph-safe.
         # Prefill (S_q > 1): dynamic-shape compiled, no recompilations.
-        flex_fn = compiled_flex_attn_decode if xq.shape[2] == 1 else compiled_flex_attn_prefill
+        if xq.device.type == "cuda":
+            flex_fn = compiled_flex_attn_decode if xq.shape[2] == 1 else compiled_flex_attn_prefill
+        else:
+            flex_fn = flex_attention
         output, aux_output = flex_fn(
             xq, xk, xv,
             block_mask=attention_masks,
@@ -194,6 +198,11 @@ def _squared_relu_gate_kernel(
 
 def squared_relu_gate(packed: T, hidden_dim: int) -> T:
     """Fused relu(gate)^2 * up for interleaved packed [g0,u0,g1,u1,...] input."""
+    if packed.device.type != "cuda":
+        gate = packed[..., 0::2]
+        up = packed[..., 1::2]
+        return (F.relu(gate).square() * up).contiguous()
+
     packed_2d = packed.flatten(0, -2)
     n_rows = packed_2d.shape[0]
     n_cols = hidden_dim
