@@ -1,5 +1,7 @@
 # Copyright (c) 2025 Technology Innovation Institute (TII), UAE.
 
+import os
+
 import torch
 from torch import Tensor as T
 from torch.nn.attention.flex_attention import (
@@ -11,12 +13,111 @@ from torch.nn.attention.flex_attention import (
     or_masks,
 )
 
-# Compiled flex_attention variants:
-# - _decode: fullgraph=True, static shapes — for decode (S_q==1), CUDA-graph safe.
-# - _prefill: dynamic=True, symbolic shapes — for prefill (S_q>1), one graph handles all lengths.
-compiled_flex_attn_decode = torch.compile(flex_attention, fullgraph=True)
-compiled_flex_attn_prefill = torch.compile(flex_attention, dynamic=True)
-_compiled_create_block_mask = torch.compile(create_block_mask, dynamic=True)
+_attention_compile_enabled = os.environ.get("FALCON_DISABLE_ATTENTION_COMPILE", "").lower() not in {
+    "1",
+    "true",
+    "yes",
+}
+_compiled_flex_attn_decode = None
+_compiled_flex_attn_prefill = None
+_compiled_create_block_mask = None
+
+
+def set_attention_compile_enabled(enabled: bool) -> None:
+    global _attention_compile_enabled
+    _attention_compile_enabled = bool(enabled)
+
+
+def attention_compile_enabled() -> bool:
+    return _attention_compile_enabled
+
+
+def _compile_error_is_recoverable(exc: Exception) -> bool:
+    message = str(exc).lower()
+    compile_markers = (
+        "torch.compile",
+        "inductor",
+        "triton",
+        "compiler",
+        "c compiler",
+        "gcc",
+        "g++",
+        "clang",
+        "cl.exe",
+        "msvc",
+        "nvrtc",
+        "backendcompilerfailed",
+    )
+    return any(marker in message for marker in compile_markers)
+
+
+def _ensure_compiled_flex_attention(*, decode: bool):
+    global _compiled_flex_attn_decode
+    global _compiled_flex_attn_prefill
+
+    compiled = _compiled_flex_attn_decode if decode else _compiled_flex_attn_prefill
+    if compiled is not None or not _attention_compile_enabled or not hasattr(torch, "compile"):
+        return compiled
+
+    try:
+        compiled = torch.compile(
+            flex_attention,
+            fullgraph=True if decode else False,
+            dynamic=False if decode else True,
+        )
+    except Exception:
+        set_attention_compile_enabled(False)
+        return None
+
+    if decode:
+        _compiled_flex_attn_decode = compiled
+    else:
+        _compiled_flex_attn_prefill = compiled
+    return compiled
+
+
+def _ensure_compiled_create_block_mask():
+    global _compiled_create_block_mask
+
+    if _compiled_create_block_mask is not None or not _attention_compile_enabled or not hasattr(torch, "compile"):
+        return _compiled_create_block_mask
+
+    try:
+        _compiled_create_block_mask = torch.compile(create_block_mask, dynamic=True)
+    except Exception:
+        set_attention_compile_enabled(False)
+        return None
+    return _compiled_create_block_mask
+
+
+def _run_with_compile_fallback(compiled_fn, eager_fn, *args, **kwargs):
+    if compiled_fn is None:
+        return eager_fn(*args, **kwargs)
+    try:
+        return compiled_fn(*args, **kwargs)
+    except Exception as exc:
+        if not _compile_error_is_recoverable(exc):
+            raise
+        set_attention_compile_enabled(False)
+        return eager_fn(*args, **kwargs)
+
+
+def compiled_flex_attn_decode(*args, **kwargs):
+    return _run_with_compile_fallback(
+        _ensure_compiled_flex_attention(decode=True),
+        flex_attention,
+        *args,
+        **kwargs,
+    )
+
+
+def compiled_flex_attn_prefill(*args, **kwargs):
+    return _run_with_compile_fallback(
+        _ensure_compiled_flex_attention(decode=False),
+        flex_attention,
+        *args,
+        **kwargs,
+    )
 
 
 def offset_mask_mod(mask_mod: _mask_mod_signature, offset: int):
@@ -102,7 +203,12 @@ def create_attention_mask(*args, **kwargs) -> BlockMask:
     device = kwargs.get("device")
     if device is not None and torch.device(device).type != "cuda":
         return create_block_mask(*args, **kwargs)
-    return _compiled_create_block_mask(*args, **kwargs)
+    return _run_with_compile_fallback(
+        _ensure_compiled_create_block_mask(),
+        create_block_mask,
+        *args,
+        **kwargs,
+    )
 
 
 def create_batch_attention_mask(

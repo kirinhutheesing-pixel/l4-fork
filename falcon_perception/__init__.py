@@ -391,6 +391,9 @@ def load_and_prepare_model(
         )
 
     import torch
+    from falcon_perception.attention import set_attention_compile_enabled
+
+    set_attention_compile_enabled(bool(compile))
 
     model, tokenizer, model_args = load_from_hf_export(
         hf_model_id=hf_model_id,

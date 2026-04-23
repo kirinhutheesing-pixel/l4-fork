@@ -348,7 +348,7 @@ def is_youtube_url(value: str) -> bool:
     return "youtube.com/" in lowered or "youtu.be/" in lowered
 
 
-def resolve_stream_source(stream: str) -> dict[str, Any]:
+def resolve_stream_source(stream: str, *, cookie_file: str | Path | None = None) -> dict[str, Any]:
     if not is_youtube_url(stream):
         return {"requested_url": stream, "resolved_url": stream, "source_type": "direct"}
 
@@ -366,6 +366,9 @@ def resolve_stream_source(stream: str) -> dict[str, Any]:
         "format": "best[protocol^=m3u8][vcodec!=none]/best[vcodec!=none]/best",
         "noplaylist": True,
     }
+    resolved_cookie_file = cookie_file or os.environ.get("YTDLP_COOKIES_FILE")
+    if resolved_cookie_file:
+        options["cookiefile"] = str(Path(resolved_cookie_file).expanduser())
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(stream, download=False)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import sys
 import threading
 import time
@@ -14,6 +15,8 @@ from typing import Any
 
 import cv2
 import numpy as np
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parent
@@ -32,6 +35,7 @@ from perception_orchestrator import (  # noqa: E402
     DEFAULT_RT_DETR_MODEL_ID,
     DEFAULT_SAM3_MODEL_ID,
     build_orchestrated_inference,
+    intersection_over_union,
     load_rtdetr_runtime,
     load_sam3_runtime,
     run_rtdetr_inference,
@@ -40,6 +44,7 @@ from perception_orchestrator import (  # noqa: E402
 from run_falcon_pipeline import (  # noqa: E402
     DEFAULT_CACHE_DIR,
     configure_huggingface_cache,
+    is_youtube_url,
     make_slug,
     open_video_capture,
     pair_bbox_entries,
@@ -74,6 +79,24 @@ PROMPT_GUIDELINES = [
     },
 ]
 
+RESTAURANT_ROLE_COLORS = {
+    "restaurant_goer": (36, 201, 138),
+    "server": (71, 144, 255),
+    "table": (88, 197, 255),
+    "needs_service": (54, 54, 235),
+}
+
+SOURCE_STATUS_IDLE = "idle"
+SOURCE_STATUS_RESOLVING = "resolving"
+SOURCE_STATUS_READY = "ready"
+SOURCE_STATUS_AUTH_REQUIRED = "auth_required"
+SOURCE_STATUS_UNAVAILABLE = "unavailable"
+
+ERROR_KIND_SOURCE_AUTH = "source_auth"
+ERROR_KIND_SOURCE_UNAVAILABLE = "source_unavailable"
+ERROR_KIND_MODEL_LOAD = "model_load"
+ERROR_KIND_INFERENCE_RUNTIME = "inference_runtime"
+
 
 def resize_image_to_bounds(image: Image.Image, *, min_dim: int, max_dim: int) -> Image.Image:
     width, height = image.size
@@ -107,6 +130,273 @@ def detection_bbox_xyxy(detection: dict[str, Any], width: int, height: int) -> t
     x1 = int(round(cx + bw / 2.0))
     y1 = int(round(cy + bh / 2.0))
     return x0, y0, x1, y1
+
+
+def bbox_norm_xyxy(bbox: dict[str, float], width: int, height: int) -> tuple[int, int, int, int]:
+    cx = float(bbox.get("x", 0.5)) * width
+    cy = float(bbox.get("y", 0.5)) * height
+    bw = float(bbox.get("w", 0.0)) * width
+    bh = float(bbox.get("h", 0.0)) * height
+    x0 = int(round(cx - bw / 2.0))
+    y0 = int(round(cy - bh / 2.0))
+    x1 = int(round(cx + bw / 2.0))
+    y1 = int(round(cy + bh / 2.0))
+    return x0, y0, x1, y1
+
+
+def detection_bbox_norm(detection: dict[str, Any]) -> dict[str, float]:
+    center = detection.get("center") or {}
+    return {
+        "x": float(center.get("x", 0.5)),
+        "y": float(center.get("y", 0.5)),
+        "w": float(detection.get("width", 0.0)),
+        "h": float(detection.get("height", 0.0)),
+    }
+
+
+def detection_overlaps(detection: dict[str, Any], candidates: list[dict[str, Any]], threshold: float = 0.2) -> bool:
+    bbox = detection_bbox_norm(detection)
+    for candidate in candidates:
+        if intersection_over_union(bbox, detection_bbox_norm(candidate)) >= threshold:
+            return True
+    return False
+
+
+def is_restaurant_tracking_prompt(prompt: str) -> bool:
+    lowered = prompt.lower()
+    markers = ("restaurant", "table", "server", "service", "guest", "diner", "waiter", "waitress")
+    return any(marker in lowered for marker in markers)
+
+
+def entity_color_bgr(entity: dict[str, Any]) -> tuple[int, int, int]:
+    if entity.get("needs_service"):
+        return RESTAURANT_ROLE_COLORS["needs_service"]
+    role = str(entity.get("role") or "")
+    if role == "server":
+        return RESTAURANT_ROLE_COLORS["server"]
+    if role == "table":
+        return RESTAURANT_ROLE_COLORS["table"]
+    return RESTAURANT_ROLE_COLORS["restaurant_goer"]
+
+
+def infer_source_type(source_url: str) -> str | None:
+    if not source_url.strip():
+        return None
+    return "youtube" if is_youtube_url(source_url) else "direct"
+
+
+def classify_source_error(message: str) -> tuple[str, str]:
+    lowered = message.lower()
+    auth_markers = (
+        "sign in to confirm you",
+        "--cookies-from-browser",
+        "use --cookies",
+        "for the authentication",
+        "cookie",
+    )
+    if any(marker in lowered for marker in auth_markers):
+        return SOURCE_STATUS_AUTH_REQUIRED, ERROR_KIND_SOURCE_AUTH
+    return SOURCE_STATUS_UNAVAILABLE, ERROR_KIND_SOURCE_UNAVAILABLE
+
+
+def build_source_state(
+    *,
+    input_url: str,
+    source_type: str | None,
+    status: str,
+    cookie_file_configured: bool,
+    resolved_url_present: bool = False,
+    title: str | None = None,
+    channel: str | None = None,
+    is_live: bool | None = None,
+    error_kind: str | None = None,
+    error_message: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "input_url": input_url,
+        "source_type": source_type,
+        "status": status,
+        "resolved_url_present": resolved_url_present,
+        "title": title,
+        "channel": channel,
+        "is_live": is_live,
+        "cookie_file_configured": cookie_file_configured,
+        "error_kind": error_kind,
+        "error_message": error_message,
+    }
+
+
+def build_source_state_from_stream_info(
+    *,
+    input_url: str,
+    cookie_file: Path | None,
+    stream_info: dict[str, Any] | None,
+    status: str,
+    error_kind: str | None = None,
+    error_message: str | None = None,
+) -> dict[str, Any]:
+    return build_source_state(
+        input_url=input_url,
+        source_type=(stream_info or {}).get("source_type") or infer_source_type(input_url),
+        status=status,
+        resolved_url_present=bool((stream_info or {}).get("resolved_url")),
+        title=(stream_info or {}).get("title"),
+        channel=(stream_info or {}).get("channel"),
+        is_live=(stream_info or {}).get("is_live"),
+        cookie_file_configured=cookie_file is not None,
+        error_kind=error_kind,
+        error_message=error_message,
+    )
+
+
+def probe_source(
+    source_url: str,
+    *,
+    cookie_file: Path | None,
+    timeout_seconds: float,
+    keep_capture_open: bool = False,
+) -> tuple[dict[str, Any], int, dict[str, Any] | None, cv2.VideoCapture | None]:
+    trimmed_source_url = source_url.strip()
+    if not trimmed_source_url:
+        state = build_source_state(
+            input_url="",
+            source_type=None,
+            status=SOURCE_STATUS_UNAVAILABLE,
+            cookie_file_configured=cookie_file is not None,
+            error_kind=ERROR_KIND_SOURCE_UNAVAILABLE,
+            error_message="No source URL provided.",
+        )
+        return state, 21, None, None
+
+    stream_info: dict[str, Any] | None = None
+    try:
+        stream_info = resolve_stream_source(trimmed_source_url, cookie_file=cookie_file)
+    except (Exception, SystemExit) as exc:
+        error_message = str(exc)
+        status, error_kind = classify_source_error(error_message)
+        state = build_source_state_from_stream_info(
+            input_url=trimmed_source_url,
+            cookie_file=cookie_file,
+            stream_info=stream_info,
+            status=status,
+            error_kind=error_kind,
+            error_message=error_message,
+        )
+        return state, (20 if error_kind == ERROR_KIND_SOURCE_AUTH else 21), stream_info, None
+
+    try:
+        capture = open_video_capture(stream_info, timeout_seconds)
+    except (Exception, SystemExit) as exc:
+        error_message = str(exc)
+        status, error_kind = classify_source_error(error_message)
+        state = build_source_state_from_stream_info(
+            input_url=trimmed_source_url,
+            cookie_file=cookie_file,
+            stream_info=stream_info,
+            status=status,
+            error_kind=error_kind,
+            error_message=error_message,
+        )
+        return state, (20 if error_kind == ERROR_KIND_SOURCE_AUTH else 21), stream_info, None
+
+    state = build_source_state_from_stream_info(
+        input_url=trimmed_source_url,
+        cookie_file=cookie_file,
+        stream_info=stream_info,
+        status=SOURCE_STATUS_READY,
+    )
+    if not keep_capture_open:
+        capture.release()
+        capture = None
+    return state, 0, stream_info, capture
+
+
+def person_is_near_table(person: dict[str, Any], tables: list[dict[str, Any]]) -> bool:
+    person_bbox = detection_bbox_norm(person)
+    px = person_bbox["x"]
+    py = person_bbox["y"]
+    pw = person_bbox["w"]
+    ph = person_bbox["h"]
+    for table in tables:
+        table_bbox = detection_bbox_norm(table)
+        tx = table_bbox["x"]
+        ty = table_bbox["y"]
+        tw = table_bbox["w"]
+        th = table_bbox["h"]
+        horizontal_close = abs(px - tx) <= max(tw * 0.9, pw * 1.25)
+        vertical_close = py >= ty - (th * 1.4 + ph * 0.4) and py <= ty + (th * 1.3)
+        if horizontal_close and vertical_close:
+            return True
+        if intersection_over_union(person_bbox, table_bbox) >= 0.02:
+            return True
+    return False
+
+
+def build_restaurant_scene_annotations(inference: dict[str, Any], prompt: str) -> dict[str, Any] | None:
+    if not is_restaurant_tracking_prompt(prompt):
+        return None
+
+    engine_outputs = inference.get("engine_outputs") or {}
+    rtdetr_output = engine_outputs.get("rt_detr") or {}
+    falcon_output = engine_outputs.get("falcon") or {}
+    candidate_detections = rtdetr_output.get("candidate_detections") or []
+
+    people = [det for det in candidate_detections if str(det.get("label") or "").lower() == "person"]
+    tables = [det for det in candidate_detections if "table" in str(det.get("label") or "").lower()]
+    falcon_people = falcon_output.get("detections") or []
+    service_prompt = "service" in prompt.lower()
+
+    entities: list[dict[str, Any]] = []
+    goer_count = 0
+    server_count = 0
+    needs_service_count = 0
+
+    for index, table in enumerate(tables, start=1):
+        entities.append(
+            {
+                "entity_id": f"table-{index}",
+                "kind": "table",
+                "role": "table",
+                "needs_service": False,
+                "bbox": detection_bbox_norm(table),
+            }
+        )
+
+    for index, person in enumerate(people, start=1):
+        near_table = person_is_near_table(person, tables)
+        needs_service = service_prompt and detection_overlaps(person, falcon_people, threshold=0.18)
+        if needs_service:
+            role = "restaurant_goer"
+            needs_service_count += 1
+            goer_count += 1
+        elif near_table:
+            role = "restaurant_goer"
+            goer_count += 1
+        else:
+            role = "server"
+            server_count += 1
+
+        entities.append(
+            {
+                "entity_id": f"person-{index}",
+                "kind": "person",
+                "role": role,
+                "needs_service": needs_service,
+                "near_table": near_table,
+                "bbox": detection_bbox_norm(person),
+            }
+        )
+
+    return {
+        "profile": "restaurant_service",
+        "entities": entities,
+        "counts": {
+            "restaurant_goers": goer_count,
+            "servers": server_count,
+            "tables": len(tables),
+            "needs_service": needs_service_count,
+        },
+    }
 
 
 def encode_jpeg(image_bgr: np.ndarray, quality: int = 85) -> bytes:
@@ -175,6 +465,7 @@ class LiveSessionConfig:
 class RuntimeOptions:
     cache_dir: Path
     output_dir: Path
+    youtube_cookie_file: Path | None = None
     falcon_model_id: str = PERCEPTION_300M_MODEL_ID
     rtdetr_model_id: str = DEFAULT_RT_DETR_MODEL_ID
     sam3_model_id: str = DEFAULT_SAM3_MODEL_ID
@@ -292,6 +583,12 @@ class FalconPipelineRealtimeService:
         self.capture: cv2.VideoCapture | None = None
         self.capture_source_key: str | None = None
         self.stream_info: dict[str, Any] | None = None
+        self.latest_source_state = build_source_state(
+            input_url=session.source_url,
+            source_type=infer_source_type(session.source_url),
+            status=(SOURCE_STATUS_IDLE if not session.source_url.strip() else SOURCE_STATUS_RESOLVING),
+            cookie_file_configured=options.youtube_cookie_file is not None,
+        )
         self.latest_frame: np.ndarray | None = None
         self.latest_frame_id = 0
         self.prompt_revision = 0
@@ -365,6 +662,10 @@ class FalconPipelineRealtimeService:
             record["state"] = state
             record["error"] = error
 
+    def _set_source_state(self, state: dict[str, Any]) -> None:
+        with self.lock:
+            self.latest_source_state = copy.deepcopy(state)
+
     def _set_placeholder_frame(self, message: str, *, clear_result: bool = False) -> None:
         payload = placeholder_frame(message)
         with self.lock:
@@ -384,6 +685,30 @@ class FalconPipelineRealtimeService:
             if record["state"] not in {"loaded", "disabled"}:
                 return False
         return True
+
+    def _derive_operator_error(
+        self,
+        *,
+        source: dict[str, Any],
+        metrics: dict[str, Any],
+        model_status: dict[str, dict[str, Any]],
+    ) -> tuple[str | None, str | None]:
+        source_error_kind = source.get("error_kind")
+        source_error_message = source.get("error_message")
+        if source_error_kind in {ERROR_KIND_SOURCE_AUTH, ERROR_KIND_SOURCE_UNAVAILABLE}:
+            return source_error_kind, source_error_message
+
+        for name in ("falcon", "rt_detr", "sam3"):
+            record = model_status.get(name) or {}
+            if record.get("state") == "error" and record.get("error"):
+                return ERROR_KIND_MODEL_LOAD, str(record.get("error"))
+
+        pipeline_state = metrics.get("pipeline_state")
+        last_error = metrics.get("last_error")
+        if pipeline_state == "error" and last_error:
+            return ERROR_KIND_INFERENCE_RUNTIME, str(last_error)
+
+        return None, None
 
     def _derive_service_state(
         self,
@@ -454,9 +779,25 @@ class FalconPipelineRealtimeService:
 
         session = self._session_copy()
         if session.source_url.strip():
+            self._set_source_state(
+                build_source_state(
+                    input_url=session.source_url,
+                    source_type=infer_source_type(session.source_url),
+                    status=SOURCE_STATUS_RESOLVING,
+                    cookie_file_configured=self.options.youtube_cookie_file is not None,
+                )
+            )
             self._set_metric("pipeline_state", "waiting_for_frame")
             self._set_placeholder_frame("Models loaded. Waiting for first live frame.", clear_result=True)
         else:
+            self._set_source_state(
+                build_source_state(
+                    input_url="",
+                    source_type=None,
+                    status=SOURCE_STATUS_IDLE,
+                    cookie_file_configured=self.options.youtube_cookie_file is not None,
+                )
+            )
             self._set_metric("pipeline_state", "waiting_for_source")
             self._set_placeholder_frame("Waiting for a stream source.", clear_result=True)
 
@@ -492,6 +833,12 @@ class FalconPipelineRealtimeService:
                 self.latest_metrics["processed_fps"] = 0.0
                 self.latest_frame_is_placeholder = True
                 self.latest_frame_note = "Switching stream source."
+                self.latest_source_state = build_source_state(
+                    input_url=self.session.source_url,
+                    source_type=infer_source_type(self.session.source_url),
+                    status=(SOURCE_STATUS_IDLE if not self.session.source_url.strip() else SOURCE_STATUS_RESOLVING),
+                    cookie_file_configured=self.options.youtube_cookie_file is not None,
+                )
             if source_changed:
                 self._set_placeholder_frame("Switching stream source.", clear_result=True)
         return self.get_state()
@@ -501,6 +848,7 @@ class FalconPipelineRealtimeService:
             result = copy.deepcopy(self.latest_result)
             metrics = copy.deepcopy(self.latest_metrics)
             session = copy.deepcopy(asdict(self.session))
+            source = copy.deepcopy(self.latest_source_state)
             stream = copy.deepcopy(self.stream_info)
             model_status = copy.deepcopy(self.model_status)
             frame = {
@@ -511,6 +859,11 @@ class FalconPipelineRealtimeService:
                 "note": self.latest_frame_note,
                 "bytes": len(self.latest_jpeg),
             }
+        error_kind, error_message = self._derive_operator_error(
+            source=source,
+            metrics=metrics,
+            model_status=model_status,
+        )
         readiness = {
             "service_state": self._derive_service_state(
                 session=session,
@@ -521,10 +874,13 @@ class FalconPipelineRealtimeService:
             "models_ready": self._models_ready(model_status),
             "capture_connected": metrics.get("capture_state") == "running",
             "integration_ready": self._models_ready(model_status) and frame["ready"],
+            "error_kind": error_kind,
+            "error_message": error_message,
         }
         return {
             "session": session,
             "metrics": metrics,
+            "source": source,
             "stream": stream,
             "result": result,
             "frame": frame,
@@ -557,10 +913,18 @@ class FalconPipelineRealtimeService:
         with self.lock:
             return bytes(self.latest_jpeg)
 
-    def _open_capture(self, source_url: str, timeout_seconds: float) -> tuple[cv2.VideoCapture, dict[str, Any]]:
-        stream_info = resolve_stream_source(source_url)
-        capture = open_video_capture(stream_info, timeout_seconds)
-        return capture, stream_info
+    def _open_capture(
+        self,
+        source_url: str,
+        timeout_seconds: float,
+    ) -> tuple[cv2.VideoCapture | None, dict[str, Any] | None, dict[str, Any], int]:
+        source_state, exit_code, stream_info, capture = probe_source(
+            source_url,
+            cookie_file=self.options.youtube_cookie_file,
+            timeout_seconds=timeout_seconds,
+            keep_capture_open=True,
+        )
+        return capture, stream_info, source_state, exit_code
 
     def _capture_loop(self) -> None:
         read_deadline_started: float | None = None
@@ -571,17 +935,34 @@ class FalconPipelineRealtimeService:
 
             if not source_url:
                 self._set_metric("capture_state", "idle")
+                self._set_source_state(
+                    build_source_state(
+                        input_url="",
+                        source_type=None,
+                        status=SOURCE_STATUS_IDLE,
+                        cookie_file_configured=self.options.youtube_cookie_file is not None,
+                    )
+                )
                 time.sleep(0.25)
                 continue
 
             if self.capture is None or self.capture_source_key != source_url:
                 self._set_metric("capture_state", "connecting")
-                try:
-                    capture, stream_info = self._open_capture(source_url, session.stream_open_timeout)
-                except Exception as exc:
+                self._set_source_state(
+                    build_source_state(
+                        input_url=source_url,
+                        source_type=infer_source_type(source_url),
+                        status=SOURCE_STATUS_RESOLVING,
+                        cookie_file_configured=self.options.youtube_cookie_file is not None,
+                    )
+                )
+                capture, stream_info, source_state, exit_code = self._open_capture(source_url, session.stream_open_timeout)
+                if exit_code != 0 or capture is None or stream_info is None:
+                    error_message = source_state.get("error_message") or "Could not resolve or open the stream source."
                     self._set_metric("capture_state", "error")
-                    self._set_metric("last_error", f"Stream connect failed: {exc}")
-                    self._set_placeholder_frame(str(exc), clear_result=True)
+                    self._set_metric("last_error", f"Stream connect failed: {error_message}")
+                    self._set_source_state(source_state)
+                    self._set_placeholder_frame(error_message, clear_result=True)
                     time.sleep(2.0)
                     continue
 
@@ -593,6 +974,7 @@ class FalconPipelineRealtimeService:
                     self.stream_info = stream_info
                     self.latest_metrics["capture_state"] = "running"
                     self.latest_metrics["last_error"] = None
+                self._set_source_state(source_state)
                 read_deadline_started = None
 
             assert self.capture is not None
@@ -747,6 +1129,9 @@ class FalconPipelineRealtimeService:
                     sam3_model_id=(self.options.sam3_model_id if session.enable_sam3 else None),
                     sam3_error=sam3_error,
                 )
+                scene_annotations = build_restaurant_scene_annotations(result, session.prompt)
+                if scene_annotations is not None:
+                    result["scene_annotations"] = scene_annotations
                 if falcon_guidance is not None:
                     result["falcon_guidance_age_seconds"] = round(time.time() - falcon_guidance.ran_at, 3)
 
@@ -773,9 +1158,11 @@ class FalconPipelineRealtimeService:
         inference: dict[str, Any],
         session: LiveSessionConfig,
     ) -> np.ndarray:
+        scene_annotations = inference.get("scene_annotations") or {}
+        entities = scene_annotations.get("entities") or []
         overlay_pil = render_visualization(
             Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)),
-            inference.get("bboxes") or [],
+            [] if entities else (inference.get("bboxes") or []),
             inference.get("masks_rle") or [],
             interior_opacity=0.22,
             border_thickness=2,
@@ -800,6 +1187,15 @@ class FalconPipelineRealtimeService:
             f"Prompt: {session.prompt}",
             f"Task: {session.task}   Detections: {len(detections)}   End-to-end: {latency_label}",
         ]
+        if scene_annotations:
+            counts = scene_annotations.get("counts") or {}
+            status_lines.append(
+                "Restaurant mode: "
+                f"goers {counts.get('restaurant_goers', 0)}   "
+                f"servers {counts.get('servers', 0)}   "
+                f"tables {counts.get('tables', 0)}   "
+                f"needs service {counts.get('needs_service', 0)}"
+            )
         if stream_title:
             status_lines.append(f"Source: {stream_title[:100]}")
 
@@ -819,7 +1215,37 @@ class FalconPipelineRealtimeService:
             )
             y += 32
 
-        for detection in detections[:24]:
+        for entity in entities[:48]:
+            bbox = entity.get("bbox") or {}
+            x0, y0, x1, y1 = bbox_norm_xyxy(bbox, width, height)
+            color = entity_color_bgr(entity)
+            role = str(entity.get("role") or entity.get("kind") or "entity").replace("_", " ")
+            if entity.get("needs_service"):
+                role = f"{role} needs service"
+            cv2.rectangle(overlay_bgr, (x0, y0), (x1, y1), color, 2)
+            text = role.upper()
+            text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.56, 2)
+            text_width, text_height = text_size
+            label_y = max(y0 - 10, 24)
+            cv2.rectangle(
+                overlay_bgr,
+                (x0, label_y - text_height - 10),
+                (x0 + text_width + 12, label_y + 4),
+                color,
+                -1,
+            )
+            cv2.putText(
+                overlay_bgr,
+                text,
+                (x0 + 6, label_y - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.56,
+                (255, 249, 237),
+                2,
+                cv2.LINE_AA,
+            )
+
+        for detection in ([] if entities else detections[:24]):
             x0, y0, x1, y1 = detection_bbox_xyxy(detection, width, height)
             label = detection.get("label") or session.prompt
             score = detection.get("score")
@@ -872,10 +1298,26 @@ def load_ui_html(path: Path) -> str:
     return "<html><body><h1>Falcon Pipeline Realtime UI missing.</h1></body></html>"
 
 
-def create_app(service: FalconPipelineRealtimeService, ui_html: str):
-    from fastapi import FastAPI, Request
-    from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+def run_source_preflight(
+    *,
+    source_url: str,
+    cookie_file: Path | None,
+    timeout_seconds: float,
+) -> tuple[dict[str, Any], int]:
+    source_state, exit_code, _stream_info, _capture = probe_source(
+        source_url,
+        cookie_file=cookie_file,
+        timeout_seconds=timeout_seconds,
+        keep_capture_open=False,
+    )
+    return {
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "source": source_state,
+    }, exit_code
 
+
+def create_app(service: FalconPipelineRealtimeService, ui_html: str):
     app = FastAPI(title="Falcon Pipeline Realtime")
 
     @app.get("/", response_class=HTMLResponse)
@@ -946,6 +1388,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", help="Torch device for Falcon orchestration.")
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR, help="HF cache directory.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Artifact output directory.")
+    parser.add_argument(
+        "--yt-cookies-file",
+        type=Path,
+        default=None,
+        help="Optional Netscape-format cookies.txt file for YouTube streams that require authentication.",
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Resolve and probe the source, emit JSON to stdout, then exit without loading models.",
+    )
     parser.add_argument("--ui-path", type=Path, default=DEFAULT_UI_PATH, help="HTML UI file to serve.")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile for Falcon.")
     parser.add_argument("--no-load-rtdetr", action="store_true", help="Skip loading RT-DETR at startup.")
@@ -964,11 +1417,23 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+
+    resolved_cookie_file = (None if args.yt_cookies_file is None else args.yt_cookies_file.expanduser().resolve())
+    if args.preflight_only:
+        payload, exit_code = run_source_preflight(
+            source_url=args.source_url,
+            cookie_file=resolved_cookie_file,
+            timeout_seconds=LiveSessionConfig().stream_open_timeout,
+        )
+        print(json.dumps(payload, indent=2))
+        return exit_code
+
     import uvicorn
 
     options = RuntimeOptions(
         cache_dir=args.cache_dir.expanduser().resolve(),
         output_dir=args.output_dir.expanduser().resolve(),
+        youtube_cookie_file=resolved_cookie_file,
         falcon_model_id=args.falcon_model_id,
         rtdetr_model_id=args.rtdetr_model_id,
         sam3_model_id=args.sam3_model_id,
