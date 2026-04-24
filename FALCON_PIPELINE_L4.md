@@ -33,7 +33,8 @@ The supported bring-up is now the SAM 3 segmentation view:
 - Falcon runs in a background guidance loop and refreshes slower natural-language context
 - SAM 3 is always loaded by the service and is not an operator toggle
 - when SAM 3 returns masks, `primary_engine` becomes `sam3` and `/api/frame.jpg` shows the SAM 3 mask overlay
-- while SAM 3 is loading or segmenting, the service can still show RT-DETR/Falcon-backed frames, but `/api/state` keeps `full_pipeline_ready=false` until SAM 3 is healthy and visibly primary
+- while SAM 3 is first loading, the service can still show RT-DETR/Falcon-backed frames, but `/api/state` keeps `full_pipeline_ready=false` until SAM 3 is healthy and visibly primary
+- after a visible SAM 3 result exists, the next `segmenting` cycle should not drop readiness on commit `60590b1` or newer
 
 SAM 3.1 note: `facebook/sam3.1` is a gated checkpoint repo, but the official Hugging Face model card says it has no Transformers integration. The current service uses the Transformers `Sam3Model` / `Sam3Processor` path, so `facebook/sam3` remains the default. Use `SAM3_MODEL_ID=facebook/sam3.1` only as an explicit compatibility probe until the service has a native `facebookresearch/sam3` package integration.
 
@@ -63,6 +64,8 @@ These are not product requirements, but they are the last known operator values 
 - SAM 3 note:
   - launching SAM 3 without approved Hugging Face access to `facebook/sam3` left the service streaming but not fully ready
   - the live blocker was model auth, not CUDA, OpenCV, or YouTube
+  - after Hugging Face approval, `facebook/sam3` loaded on the L4 and produced CUDA masks as the visible primary engine
+  - `facebook/sam3.1` was probed but did not produce a ready Transformers-backed runtime; keep it as a compatibility probe only
 
 If the preferred zone is exhausted again, retry another L4-capable zone before changing the runtime design.
 
@@ -203,6 +206,8 @@ Notes:
 - neither weights nor outputs are baked into the image
 - the image must include `build-essential` and `python3-dev` for Falcon/Triton helper compilation
 - if Falcon logs mention `Failed to find C compiler` or `Python.h: No such file or directory`, rebuild from the current repo before debugging anything else
+- on Windows/IAP, foreground SSH can drop during Docker layer export; if that happens, check `sudo docker images` before rebuilding
+- if the image is absent after an SSH drop, rerun the build as a detached VM-side job and poll `/tmp/falcon-pipeline-build.log`
 
 ## 5. Launch the service
 
@@ -245,6 +250,8 @@ Optional runtime environment toggles:
 - `FALCON_MIN_DIM`, `FALCON_MAX_DIM`, `FALCON_MAX_NEW_TOKENS`
 - `MIN_DIM`, `MAX_DIM`
 
+Keep `SAM3_MODEL_ID=facebook/sam3` for supported runs. `facebook/sam3.1` is not yet a supported runtime path in this service.
+
 Important:
 - YouTube cookies and Hugging Face model access are separate concerns
 - `cookies.txt` only fixes bot-gated YouTube ingest
@@ -282,7 +289,7 @@ The April 24 live run proved that source ingest, Falcon, and RT-DETR can work wh
 From your local machine:
 
 ```powershell
-gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE -- -L 8080:localhost:8080
+gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --tunnel-through-iap --strict-host-key-checking=no --ssh-flag='-L' --ssh-flag='127.0.0.1:8080:127.0.0.1:8080' --ssh-flag='-N'
 ```
 
 Use only the tunnel during first bring-up. Do not expose port `8080` publicly yet.
@@ -469,6 +476,7 @@ If `/api/state` says `service_state = "degraded"` or `full_pipeline_ready = fals
 - inspect `result.engines[*]`
 - treat `result.engines[].status = "error"` for `falcon` as a real pipeline failure
 - treat `result.engines[].status = "error"` for `sam3` as a real segmentation failure because SAM 3 is mandatory
+- if `result.primary_engine = "sam3"` but `sam3_segmentation_state = "segmenting"`, make sure the VM has commit `60590b1` or newer; older builds flapped readiness while computing the next mask
 
 If `/api/state` shows `capture_state = "error"`:
 - the source URL is not currently usable

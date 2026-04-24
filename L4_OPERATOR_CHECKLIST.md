@@ -64,6 +64,14 @@ If the winning zone is not the same as `$env:ZONE`, update `$env:ZONE` before th
 gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --strict-host-key-checking=no --command='cd /home/kirin && if [ ! -d l4-fork ]; then git clone https://github.com/kirinhutheesing-pixel/l4-fork.git; fi && cd /home/kirin/l4-fork && git pull --ff-only && sudo docker build -f Dockerfile.gcp-l4 -t falcon-pipeline:l4 .'
 ```
 
+If IAP/Plink drops during layer export, do not restart blindly. First check:
+
+```powershell
+gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --tunnel-through-iap --strict-host-key-checking=no --command='sudo docker images --format "{{.Repository}}:{{.Tag}} {{.ID}} {{.Size}}" | grep falcon-pipeline || true'
+```
+
+If no `falcon-pipeline:l4` image exists, rerun the build as a detached VM-side job and poll `/tmp/falcon-pipeline-build.log`.
+
 ## 4. Start the service
 
 ```powershell
@@ -98,7 +106,7 @@ Useful optional launcher env vars:
 
 Confirm `/api/state` before judging the screen:
 - `result.primary_engine = "sam3"`
-- `metrics.sam3_segmentation_state = "ready"`
+- `metrics.sam3_segmentation_state = "ready"` or `segmenting` with a recent SAM 3 primary result on commit `60590b1` or newer
 - `readiness.sam3_visual_ready = true`
 - `readiness.full_pipeline_ready = true`
 - `readiness.blocking_engine_errors = []`
@@ -137,7 +145,7 @@ Use raw `/api/state` when you need:
 ## 6. Tunnel locally
 
 ```powershell
-gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE -- -L 8080:localhost:8080
+gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --tunnel-through-iap --strict-host-key-checking=no --ssh-flag='-L' --ssh-flag='127.0.0.1:8080:127.0.0.1:8080' --ssh-flag='-N'
 ```
 
 Then open:
@@ -153,6 +161,7 @@ If VM creation fails:
 If SSH flags fail on Windows:
 - remove OpenSSH `-o ...` flags
 - keep `--strict-host-key-checking=no`
+- for local tunnels, prefer `--tunnel-through-iap` plus explicit `--ssh-flag` values; the plain `-- -L ...` form was parsed incorrectly on this Windows setup
 
 If SCP fails on Windows:
 - use absolute remote paths like `/home/kirin/l4-fork/...`
@@ -183,8 +192,9 @@ If `/api/state` shows:
 
 Then:
 - stop debugging the stream or the GPU
-- this is a Hugging Face access problem on `facebook/sam3`
+- this is a Hugging Face access or unsupported-checkpoint problem on the selected SAM model id
 - rerun with an approved `HF_TOKEN`
+- use `facebook/sam3` for supported runs; `facebook/sam3.1` still needs a separate integration proof
 
 If everyone is `unclassified` in `scene_annotations`:
 - inspect `result.engine_outputs.falcon.detections`

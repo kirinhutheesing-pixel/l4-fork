@@ -369,7 +369,8 @@ SAM 3 visual behavior:
 - RT-DETR/Falcon boxes are queued as SAM 3 prompts
 - once SAM 3 produces masks, `result.primary_engine = "sam3"`
 - `/api/frame.jpg` then draws SAM 3 masks as the primary overlay
-- while SAM 3 is still loading or segmenting, frames can continue to update from RT-DETR/Falcon, but `readiness.full_pipeline_ready` and `readiness.sam3_visual_ready` must remain `false`
+- while SAM 3 is first loading, frames can continue to update from RT-DETR/Falcon, but `readiness.full_pipeline_ready` and `readiness.sam3_visual_ready` must remain `false`
+- after a visible SAM 3 result exists, the next `segmenting` cycle should keep readiness live on commit `60590b1` or newer
 
 Diagnostics added for future agents:
 - `metrics.falcon_guidance_state`
@@ -520,3 +521,101 @@ The next setup should be treated as:
 - engine prove-up
 
 in that exact order
+
+## April 24 approved SAM 3 VM run
+
+Purpose:
+- rerun the L4 service after Hugging Face approved access for SAM 3
+- keep the image build directly on the VM, matching the prior proven process
+- test whether SAM 3.1 could be used without a larger integration rewrite
+
+Cloud result:
+- VM name: `falcon-pipeline-l4`
+- project: `tableminder`
+- zone: `us-east4-c`
+- machine: `g2-standard-8`
+- host GPU: `NVIDIA L4`
+- Docker GPU probe: passed
+- image build: completed on the VM as `falcon-pipeline:l4`
+- final VM state: deleted and verified absent along with same-name boot disk
+
+Repository commits made before/during the run:
+- `2a658db`: made SAM 3 mandatory for the L4 realtime runtime
+- `a763722`: added `SAM3_MODEL_ID` launcher override and documented SAM 3.1 as a compatibility probe
+- `60590b1`: kept SAM 3 visual readiness true while the next mask pass is `segmenting`
+
+Source result:
+- source URL: `https://www.youtube.com/watch?v=S605ycm0Vlk`
+- prompt: `track restaurant goers, servers, and tables. person turns red if looking for service.`
+- YouTube cookies were not required
+- preflight returned `source.status = "ready"`
+- source metadata resolved as Hogs Breath Saloon Key West live content
+
+SAM 3.1 probe:
+- `facebook/sam3.1` exposed an authenticated `config.json`, so a basic Hugging Face file probe can pass
+- launching the service with `SAM3_MODEL_ID=facebook/sam3.1` did not produce a ready SAM path
+- `/api/state` reported SAM as blocked with `error_kind = "model_access"`
+- this confirms `facebook/sam3.1` must not become the default until a native package/checkpoint integration is implemented and proven
+- keep `facebook/sam3` as the supported runtime model id
+
+Successful SAM 3 run:
+- launching with `SAM3_MODEL_ID=facebook/sam3` succeeded
+- Falcon loaded on CUDA
+- RT-DETR loaded on CUDA
+- SAM 3 loaded on CUDA
+- `/api/state` reached:
+  - `readiness.service_state = "live"`
+  - `readiness.models_ready = true`
+  - `readiness.capture_connected = true`
+  - `readiness.integration_ready = true`
+  - `readiness.full_pipeline_ready = true`
+  - `readiness.sam3_visual_ready = true`
+  - `readiness.blocking_engine_errors = []`
+- `result.primary_engine = "sam3"`
+- SAM 3 engine returned:
+  - `status = "ok"`
+  - `model_id = "facebook/sam3"`
+  - `device = "cuda"`
+  - `detections_count = 21`
+  - `num_masks = 21`
+  - `prompt_boxes_count = 12`
+  - observed mask generation around `0.5` to `0.9` seconds
+- `check_realtime_service.sh` passed with `full_pipeline_ready = true`
+
+Runtime issue found:
+- `/api/state` could flap between `live` and `degraded`
+- the screen stayed SAM-primary, but readiness temporarily became false while `metrics.sam3_segmentation_state = "segmenting"`
+- this was a state-contract bug, not a model failure
+- commit `60590b1` fixes this by treating a recent visible SAM 3 overlay as ready while the next SAM 3 pass is segmenting
+- this fix passed local unit tests but was not re-proven on the VM before teardown
+
+Tunnel notes:
+- direct external SSH timed out after VM creation
+- `--tunnel-through-iap` worked for VM commands
+- Windows `gcloud compute ssh ... -- -L ...` did not work because gcloud parsed `-L` incorrectly in this environment
+- the working local tunnel syntax used explicit flags:
+  - `--ssh-flag='-L'`
+  - `--ssh-flag='127.0.0.1:8080:127.0.0.1:8080'`
+  - `--ssh-flag='-N'`
+- local `http://127.0.0.1:8080/api/healthz` returned `200`
+
+Operational lessons:
+- build long Docker images as detached VM-side jobs when using IAP/Plink, or SSH drops can kill the build during layer export
+- if a foreground build disconnects during export, check `sudo docker images` before rebuilding
+- if no image exists, run the build with `nohup ... > /tmp/falcon-pipeline-build.log 2>&1 &` and poll the log
+- SAM 3 model access is now solved for `facebook/sam3`, but not for `facebook/sam3.1`
+- full readiness must be judged from `/api/state`, not only from `/api/frame.jpg`
+
+Hardening needed next:
+- prove commit `60590b1` on a fresh VM run and confirm readiness no longer flaps while SAM 3 is segmenting
+- update `check_realtime_service.sh` to tolerate `sam3_segmentation_state = "segmenting"` when a recent SAM 3 primary overlay exists
+- add a SAM model preflight/probe that distinguishes:
+  - no token
+  - gated access missing
+  - checkpoint available but unsupported by Transformers
+  - model files present but runtime load failed
+- improve `load_sam3_runtime` error classification so SAM 3.1 unsupported-format failures do not get mislabeled as pure `model_access`
+- add a script path for detached VM-side Docker builds and log polling, because this run proved the direct foreground SSH build is brittle during export
+- update tunnel docs to prefer IAP plus `--ssh-flag` syntax on this Windows machine
+- add a state test for the exact flapping sequence observed live: ready SAM result, worker enters `segmenting`, readiness remains live
+- add a smoke assertion that `result.primary_engine = "sam3"` and `result.engines[name=sam3].num_masks > 0`, not only `full_pipeline_ready = true`
