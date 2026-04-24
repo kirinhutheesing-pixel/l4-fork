@@ -320,6 +320,8 @@ Then access:
 http://127.0.0.1:8080
 ```
 
+The browser UI should use `/api/frame.jpg` polling as the default visual path. On the April 24 source-switch run, long-lived `/api/stream.mjpg` requests wedged the local Windows IAP/PuTTY tunnel even though the VM-side service and source were healthy. Keep `/api/stream.mjpg` available as a diagnostic endpoint, but do not treat it as the preferred operator UI transport over this tunnel.
+
 ## 7. Verify the runtime contract
 
 ### Liveness
@@ -443,7 +445,7 @@ curl -s http://127.0.0.1:8080/api/frame.jpg --output frame-2.jpg
 
 When the service is live, the files should change over time and `/api/state` should report `frame.ready = true`.
 
-### MJPEG browser stream
+### Browser overlay
 
 Open:
 
@@ -451,7 +453,7 @@ Open:
 http://127.0.0.1:8080
 ```
 
-The UI should show the continuous overlay stream and current prompt controls.
+The UI should show the overlay and current prompt controls. Current UI builds poll `/api/frame.jpg?t=...` and skip overlapping frame/state requests to avoid tunnel stalls during source switches. `/api/stream.mjpg` remains available for diagnostics, but the first supported browser path is frame polling.
 
 ## 8. Update the prompt without restarting
 
@@ -512,6 +514,11 @@ If `/api/state` shows `capture_state = "error"`:
 - replace it with another current public YouTube live URL
 - if the error mentions bot checks or cookies, use `--yt-cookies-file`
 
+If changing the source URL makes the local browser appear stuck:
+- first check direct VM `/api/state` before assuming YouTube or SAM3 failed
+- if the VM reports `source.status = "ready"` and `readiness.service_state = "live"`, restart the local tunnel
+- confirm the VM image or hot-patched checkout includes commit `b435f76` or newer, because older UI builds used a long-lived MJPEG stream that could wedge the Windows tunnel
+
 If `/api/state` shows `source.status = "auth_required"`:
 - stop debugging Falcon and RT-DETR
 - export `cookies.txt`
@@ -524,6 +531,12 @@ If `/api/frame.jpg` stays placeholder:
 - confirm `frame.capture_has_frame = true`
 - confirm `model_status.falcon.state = "loaded"`
 - confirm `model_status.rt_detr.state = "loaded"`
+
+If latency is far below 10 FPS:
+- inspect `metrics.processed_fps`, `metrics.falcon_guidance_generation_seconds`, `metrics.sam3_segmentation_generation_seconds`, and `result.frame_generation_seconds`
+- do not assume the L4 is too weak until GPU utilization and per-stage timings prove it
+- the April 24 source-switch run showed about `0.42` to `0.50` processed FPS, Falcon guidance around `4.2` to `8.0` seconds, SAM3 segmentation around `0.50` to `0.90` seconds, and bursty GPU use
+- the next hardening target is to decouple display FPS from heavy model inference, not to buy a larger GPU first
 
 If the frame is live but everyone is `unclassified`:
 - inspect `result.scene_annotations.counts`

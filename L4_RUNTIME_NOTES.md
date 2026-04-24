@@ -652,3 +652,128 @@ Next VM acceptance should prove:
 - readiness does not flap while SAM3 alternates between `ready` and `segmenting`
 - `check_realtime_service.sh` passes without weakening the SAM3 visible-primary checks
 - `SAM3_MODEL_ID=facebook/sam3.1` fails cleanly as `model_unsupported` or `model_access`, not a generic SAM error
+
+## April 24 SAM3 source-switch, UI, and latency VM run
+
+Purpose:
+- validate the hardened SAM3-required runtime on a live L4 VM
+- make SAM3 the visible screen output while keeping RT-DETR boxes hidden
+- prove prompt updates and source URL changes through the browser UI
+- collect latency evidence before deciding whether 10 FPS needs a larger GPU or a different runtime structure
+
+Cloud path:
+- VM name: `falcon-pipeline-l4`
+- project: `tableminder`
+- zone: `us-east4-c`
+- machine: `g2-standard-8`
+- GPU: one `NVIDIA L4`
+- access path: SSH tunnel only through local `127.0.0.1:8080`
+- VM checkout at start of the run: `/home/kirin/l4-fork` was still on commit `83c8e28`
+- local repo commits later produced and pushed during the run:
+  - `ebe3a47`: render SAM3 overlay without detector boxes
+  - `b435f76`: poll `/api/frame.jpg` in the UI instead of holding an MJPEG connection open
+- next VM run must build from `origin/main` commit `b435f76` or newer; do not rely on the hot-patched container from this run
+
+Sources used:
+- Hogs Breath stream: `https://www.youtube.com/watch?v=S605ycm0Vlk`
+- Jimmy's Fish House source-switch test: `https://www.youtube.com/live/9c1oLjB3wIs?si=7Xmt2xcyhWaXCOOV`
+- restaurant prompt: `track restaurant goers, servers, and tables. person turns red if looking for service.`
+- YouTube cookies were not required for either observed source in this run
+- after switching to the Jimmy's source, direct `/api/state` on the VM showed `source.status = "ready"` and the service stayed live
+
+Runtime edits and hot patches applied during the run:
+- `falcon_pipeline_realtime_service.py` was updated so the visible overlay no longer draws RT-DETR or Falcon rectangles
+- RT-DETR and Falcon detections remain internal guidance for SAM3 and restaurant annotations
+- visible people are represented by SAM3 mask colors instead of detector boxes
+- restaurant role colors now drive the visible mask tint:
+  - red for `needs_service`
+  - blue for `restaurant_goer`
+  - amber for `server`
+  - neutral gray for unclassified or unsupported entities
+- unmatched role entities can receive small color markers, but the detector rectangles stay hidden
+- tests were added or updated to cover hidden detector boxes, role-colored SAM3 masks, prompt editing, and frame-polling UI behavior
+- the running VM/container was hot-patched with newer files via copy/restart during diagnosis; this is not the preferred future path
+
+Prompt and session-update issue:
+- symptom: the natural-language prompt field could not be edited reliably in the browser
+- root cause: the UI state poll refreshed the input values while the operator was typing
+- fix: `falcon_pipeline_realtime_ui.html` now tracks pending local edits and does not overwrite dirty form fields until after a successful session update
+- proof: after the fix, `/api/session` accepted the restaurant prompt and `/api/state` reflected it without restarting the service
+
+Source-switch and local stream issue:
+- symptom: changing the stream URL made the local page appear broken and the user could not see the live stream
+- direct VM evidence showed the Jimmy's source was live and `source.status = "ready"`
+- root cause: the local Windows PuTTY/IAP tunnel was wedged by long-lived `/api/stream.mjpg` and stale browser requests, not by YouTube or SAM3
+- fix: the UI now polls `/api/frame.jpg?t=...` instead of using `/api/stream.mjpg` as the default visual transport
+- additional UI fix: state polling was slowed and overlapping frame/state requests are skipped
+- operator rule: if a source switch looks broken, check direct VM `/api/state` first; if the VM is live but local browser requests time out, restart the local tunnel and confirm the UI is on commit `b435f76` or newer
+- `/api/stream.mjpg` can remain available for diagnostics, but `/api/frame.jpg` polling is the safer default over this Windows IAP/PuTTY tunnel
+
+Final observed live state before teardown:
+- `readiness.service_state = "live"`
+- `readiness.full_pipeline_ready = true`
+- `readiness.sam3_visual_ready = true`
+- `source.status = "ready"`
+- `source.input_url = "https://www.youtube.com/live/9c1oLjB3wIs?si=7Xmt2xcyhWaXCOOV"`
+- `result.primary_engine = "sam3"`
+- `result.num_masks = 6` in the final local-tunnel snapshot
+- `metrics.pipeline_state = "running"`
+- `metrics.processed_fps = 0.47` in the final local-tunnel snapshot
+- `metrics.falcon_guidance_generation_seconds = 5.67` in the final local-tunnel snapshot
+- `metrics.sam3_segmentation_generation_seconds = 0.50` in the final local-tunnel snapshot
+- `result.frame_generation_seconds = 0.44` in the final local-tunnel snapshot
+
+Earlier latency samples in the same run:
+- processed FPS varied around `0.42` to `0.50`
+- SAM3 segmentation generation varied around `0.50` to `0.90` seconds
+- Falcon guidance generation varied around `4.2` to `8.0` seconds
+- L4 VRAM use was about `5.3 GB / 23.0 GB`
+- GPU utilization was bursty rather than continuously saturated
+- examples observed during polling included low or idle utilization between inference bursts, with occasional higher spikes
+
+Latency interpretation:
+- the current implementation is not a 10 FPS realtime video pipeline
+- the L4 GPU is not the only bottleneck because the GPU is not continuously saturated
+- wall time is dominated by pipeline structure: capture, RT-DETR guidance, SAM3 segmentation, Falcon guidance, overlay generation, JSON state, and browser delivery are coupled too tightly
+- Falcon is the slowest semantic component; even at a five-second refresh, it can dominate the background pipeline
+- SAM3 can produce visible masks on the L4, but full-frame SAM3 refreshes are still far below 10 FPS
+- increasing GPU size alone is unlikely to create 10 FPS unless the render path is decoupled from heavy inference
+
+Accuracy shortcomings observed:
+- SAM3 masks are visible and useful, but they are instance masks, not restaurant roles by themselves
+- role coloring is still derived from heuristic classification layered on top of Falcon/RT-DETR/SAM evidence
+- static frames do not reliably prove `looking for service`; that needs temporal behavior, posture, hand/face direction, or repeated attention cues
+- table detection remains unreliable on some livestream angles
+- when Falcon returns full-frame prompt guidance or RT-DETR misses guest-context objects, the conservative classifier may leave people `unclassified`
+- forcing every person into a role would be misleading; unsupported people should stay `unclassified` until there is stronger evidence
+
+What worked:
+- source ingest worked for both tested YouTube live URLs without cookies
+- Falcon loaded and produced guidance
+- RT-DETR loaded and supplied prompt boxes
+- SAM3 loaded with the approved Hugging Face token and became the visible primary engine
+- the service reached `full_pipeline_ready = true`
+- `/api/frame.jpg` returned live SAM3 overlay frames
+- prompt updates worked after the UI dirty-field fix
+- source changes worked on the VM side after checking `/api/state`
+
+What did not meet the product target:
+- the display was not close to 10 FPS
+- the classification layer was not accurate enough to be trusted as restaurant operations intelligence
+- source switches could still confuse the operator when the local tunnel was stale
+- the VM had to be hot-patched during the run instead of rebuilding from current `origin/main`
+
+Next-run requirement:
+- start by building the image fresh from `origin/main` at `b435f76` or newer
+- keep RT-DETR/Falcon boxes hidden; the user should see only SAM3 color output and minimal markers
+- treat `/api/frame.jpg` polling as the primary UI delivery mechanism
+- use `/api/state` as the source of truth for source-switch diagnosis
+- focus implementation work on decoupling display FPS from AI inference FPS and improving restaurant role evidence
+- do not spend the next run chasing a larger GPU until the pipeline is profiled and the render/inference loops are separated
+
+Teardown:
+- requested after notes
+- `delete_l4_vm.ps1` hit a transient `gcloud` `RemoteDisconnected` after submitting the delete request
+- follow-up `gcloud compute instances describe falcon-pipeline-l4 --project=tableminder --zone=us-east4-c` returned resource not found
+- follow-up `gcloud compute disks describe falcon-pipeline-l4 --project=tableminder --zone=us-east4-c` returned HTTP `404` resource not found
+- local port `8080` had no `LISTENING` tunnel left after teardown, only closed `TIME_WAIT` sockets and one browser retry

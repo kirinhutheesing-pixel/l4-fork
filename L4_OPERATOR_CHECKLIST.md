@@ -154,6 +154,8 @@ Then open:
 - `http://127.0.0.1:8080/api/state`
 - `http://127.0.0.1:8080/api/frame.jpg`
 
+The browser UI should use `/api/frame.jpg` polling. Avoid using `/api/stream.mjpg` as the normal operator path over the Windows IAP/PuTTY tunnel; it remains a diagnostic endpoint only.
+
 ## 7. When it fails
 
 If VM creation fails:
@@ -175,6 +177,12 @@ If the source fails with YouTube bot-check text:
 If preflight returns `source.status = ready`:
 - do not add cookies just because the source is YouTube
 - the Hogs Breath stream `https://www.youtube.com/watch?v=S605ycm0Vlk` resolved without cookies on 2026-04-23
+
+If changing the source URL appears to break the browser:
+- check VM-side `/api/state` first
+- if `source.status = ready` and `readiness.service_state = live`, the stream is not the blocker
+- restart the local tunnel and refresh the page
+- confirm the build is on commit `b435f76` or newer so the UI uses frame polling instead of a long-lived MJPEG request
 
 If the service is up but the frame stays placeholder:
 - inspect `/api/state`
@@ -212,6 +220,14 @@ If everyone is `unclassified` in `scene_annotations`:
 - inspect `result.scene_annotations.entities[*].role_reason`
 - if Falcon only returned one full-frame prompt box and RT-DETR found no tables, the classification layer does not have enough usable grounding on that frame
 - that is a prompt/heuristic limitation, not a VM health failure
+
+If latency is the blocker:
+- collect `metrics.processed_fps`
+- collect `metrics.falcon_guidance_generation_seconds`
+- collect `metrics.sam3_segmentation_generation_seconds`
+- collect `result.frame_generation_seconds`
+- check GPU utilization before assuming the GPU is undersized
+- the April 24 source-switch run was around `0.42` to `0.50` processed FPS even though GPU use was bursty, so the next fix is pipeline scheduling and cached overlay rendering
 
 ## 8. Delete the VM
 

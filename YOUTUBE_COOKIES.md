@@ -12,6 +12,7 @@ Do not add cookies just because the source is YouTube.
 
 On 2026-04-23 the stream `https://www.youtube.com/watch?v=S605ycm0Vlk` resolved cleanly without cookies on the L4 VM.
 On 2026-04-24 the same stream still resolved cleanly without cookies during a segmentation-mode run.
+On the later April 24 source-switch run, `https://www.youtube.com/live/9c1oLjB3wIs?si=7Xmt2xcyhWaXCOOV` also resolved with `source.status = "ready"` without cookies.
 
 Use cookies only if preflight or `/api/state` reports:
 - `source.status = "auth_required"`
@@ -85,3 +86,12 @@ If source preflight is `ready` but SAM preflight exits:
 - `25`: generic SAM model-load/runtime failure
 
 Do not refresh YouTube cookies for SAM preflight failures.
+
+## 6. Source switches versus cookie failures
+
+If a new YouTube URL appears to break the local browser but `/api/state` reports:
+- `source.status = "ready"`
+- `readiness.service_state = "live"`
+- `frame.ready = true`
+
+then cookies are not the first suspect. On the April 24 source-switch run, the VM-side source was healthy and the local issue was a stale or wedged Windows IAP/PuTTY tunnel caused by long-lived MJPEG requests. Restart the local tunnel, refresh the page, and confirm the UI build uses `/api/frame.jpg` polling from commit `b435f76` or newer.
