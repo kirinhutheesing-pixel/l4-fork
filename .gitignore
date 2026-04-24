@@ -11,4 +11,5 @@ __pycache__/
 outputs/
 .tmp/
 .tmp-tests/
+.tmp-*-tunnel*.log
 .gcloud-config-l4*/

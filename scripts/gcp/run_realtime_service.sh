@@ -10,6 +10,19 @@ PORT="${PORT:-8080}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-/opt/falcon-pipeline/hf-cache}"
 OUTPUT_DIR="${OUTPUT_DIR:-/opt/falcon-pipeline/outputs}"
 COOKIE_TARGET="/run/secrets/youtube-cookies.txt"
+TASK="segmentation"
+MIN_DIM="${MIN_DIM:-480}"
+MAX_DIM="${MAX_DIM:-960}"
+FALCON_MIN_DIM="${FALCON_MIN_DIM:-256}"
+FALCON_MAX_DIM="${FALCON_MAX_DIM:-640}"
+FALCON_MAX_NEW_TOKENS="${FALCON_MAX_NEW_TOKENS:-128}"
+FALCON_REFRESH_SECONDS="${FALCON_REFRESH_SECONDS:-5.0}"
+
+if [[ -z "${HF_TOKEN:-}" && -z "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
+  echo "SAM 3 is mandatory, but no HF_TOKEN or HUGGING_FACE_HUB_TOKEN is set." >&2
+  echo "facebook/sam3 is gated; request access and rerun with an approved Hugging Face token." >&2
+  exit 22
+fi
 
 mkdir -p "${HF_CACHE_DIR}" "${OUTPUT_DIR}"
 
@@ -22,6 +35,10 @@ if [[ -n "${HF_TOKEN:-}" ]]; then
   common_args+=(
     -e "HF_TOKEN=${HF_TOKEN}"
     -e "HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}"
+  )
+elif [[ -n "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
+  common_args+=(
+    -e "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}"
   )
 fi
 
@@ -40,6 +57,16 @@ service_entrypoint=(
   --entrypoint /app/.venv/bin/python
   "${IMAGE_NAME}"
   /app/falcon_pipeline_realtime_service.py
+)
+
+service_runtime_args=(
+  --task "${TASK}"
+  --min-dim "${MIN_DIM}"
+  --max-dim "${MAX_DIM}"
+  --falcon-min-dim "${FALCON_MIN_DIM}"
+  --falcon-max-dim "${FALCON_MAX_DIM}"
+  --falcon-max-new-tokens "${FALCON_MAX_NEW_TOKENS}"
+  --falcon-refresh-seconds "${FALCON_REFRESH_SECONDS}"
 )
 
 preflight_cmd=(
@@ -79,6 +106,7 @@ launch_cmd=(
   --cache-dir /app/.cache/huggingface
   --output-dir /app/outputs/falcon-pipeline-realtime
   --no-compile
+  "${service_runtime_args[@]}"
   "${service_cookie_args[@]}"
 )
 

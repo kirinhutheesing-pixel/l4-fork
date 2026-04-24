@@ -6,6 +6,21 @@ Use this only when a YouTube stream fails with auth/bot-check errors such as:
 
 Do not use `--cookies-from-browser` as the normal workflow on this Windows machine. Export a real Netscape-format `cookies.txt` instead.
 
+## 0. Try preflight first
+
+Do not add cookies just because the source is YouTube.
+
+On 2026-04-23 the stream `https://www.youtube.com/watch?v=S605ycm0Vlk` resolved cleanly without cookies on the L4 VM.
+On 2026-04-24 the same stream still resolved cleanly without cookies during a segmentation-mode run.
+
+Use cookies only if preflight or `/api/state` reports:
+- `source.status = "auth_required"`
+- `readiness.error_kind = "source_auth"`
+
+Do not confuse this with gated model access:
+- YouTube cookies do not help if `SAM 3` fails to load from Hugging Face
+- that case requires an `HF_TOKEN` with approved access to `facebook/sam3`
+
 ## 1. Export the cookie file locally
 
 Requirements:

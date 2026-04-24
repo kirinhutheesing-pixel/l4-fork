@@ -35,6 +35,7 @@ from perception_orchestrator import (  # noqa: E402
     DEFAULT_RT_DETR_MODEL_ID,
     DEFAULT_SAM3_MODEL_ID,
     build_orchestrated_inference,
+    classify_engine_error_kind,
     intersection_over_union,
     load_rtdetr_runtime,
     load_sam3_runtime,
@@ -83,6 +84,7 @@ RESTAURANT_ROLE_COLORS = {
     "restaurant_goer": (36, 201, 138),
     "server": (71, 144, 255),
     "table": (88, 197, 255),
+    "unclassified": (168, 184, 196),
     "needs_service": (54, 54, 235),
 }
 
@@ -95,6 +97,7 @@ SOURCE_STATUS_UNAVAILABLE = "unavailable"
 ERROR_KIND_SOURCE_AUTH = "source_auth"
 ERROR_KIND_SOURCE_UNAVAILABLE = "source_unavailable"
 ERROR_KIND_MODEL_LOAD = "model_load"
+ERROR_KIND_MODEL_ACCESS = "model_access"
 ERROR_KIND_INFERENCE_RUNTIME = "inference_runtime"
 
 
@@ -162,6 +165,32 @@ def detection_overlaps(detection: dict[str, Any], candidates: list[dict[str, Any
     return False
 
 
+def detection_area_norm(detection: dict[str, Any]) -> float:
+    bbox = detection_bbox_norm(detection)
+    return max(0.0, bbox["w"]) * max(0.0, bbox["h"])
+
+
+def is_broad_guidance_detection(detection: dict[str, Any]) -> bool:
+    bbox = detection_bbox_norm(detection)
+    return detection_area_norm(detection) >= 0.60 or (bbox["w"] >= 0.85 and bbox["h"] >= 0.85)
+
+
+def focused_guidance_detections(detections: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [detection for detection in detections if not is_broad_guidance_detection(detection)]
+
+
+def first_guidance_overlap(
+    person: dict[str, Any],
+    guidance_sources: list[tuple[str, list[dict[str, Any]]]],
+    *,
+    threshold: float = 0.18,
+) -> str | None:
+    for source_name, detections in guidance_sources:
+        if detection_overlaps(person, focused_guidance_detections(detections), threshold=threshold):
+            return source_name
+    return None
+
+
 def is_restaurant_tracking_prompt(prompt: str) -> bool:
     lowered = prompt.lower()
     markers = ("restaurant", "table", "server", "service", "guest", "diner", "waiter", "waitress")
@@ -176,6 +205,8 @@ def entity_color_bgr(entity: dict[str, Any]) -> tuple[int, int, int]:
         return RESTAURANT_ROLE_COLORS["server"]
     if role == "table":
         return RESTAURANT_ROLE_COLORS["table"]
+    if role == "unclassified":
+        return RESTAURANT_ROLE_COLORS["unclassified"]
     return RESTAURANT_ROLE_COLORS["restaurant_goer"]
 
 
@@ -197,6 +228,12 @@ def classify_source_error(message: str) -> tuple[str, str]:
     if any(marker in lowered for marker in auth_markers):
         return SOURCE_STATUS_AUTH_REQUIRED, ERROR_KIND_SOURCE_AUTH
     return SOURCE_STATUS_UNAVAILABLE, ERROR_KIND_SOURCE_UNAVAILABLE
+
+
+def classify_model_load_error_kind(message: str | None) -> str:
+    if classify_engine_error_kind(message) == ERROR_KIND_MODEL_ACCESS:
+        return ERROR_KIND_MODEL_ACCESS
+    return ERROR_KIND_MODEL_LOAD
 
 
 def build_source_state(
@@ -311,25 +348,45 @@ def probe_source(
     return state, 0, stream_info, capture
 
 
-def person_is_near_table(person: dict[str, Any], tables: list[dict[str, Any]]) -> bool:
+def person_is_near_anchor(person: dict[str, Any], anchors: list[dict[str, Any]]) -> bool:
     person_bbox = detection_bbox_norm(person)
     px = person_bbox["x"]
     py = person_bbox["y"]
     pw = person_bbox["w"]
     ph = person_bbox["h"]
-    for table in tables:
-        table_bbox = detection_bbox_norm(table)
-        tx = table_bbox["x"]
-        ty = table_bbox["y"]
-        tw = table_bbox["w"]
-        th = table_bbox["h"]
+    for anchor in anchors:
+        anchor_bbox = detection_bbox_norm(anchor)
+        tx = anchor_bbox["x"]
+        ty = anchor_bbox["y"]
+        tw = anchor_bbox["w"]
+        th = anchor_bbox["h"]
         horizontal_close = abs(px - tx) <= max(tw * 0.9, pw * 1.25)
         vertical_close = py >= ty - (th * 1.4 + ph * 0.4) and py <= ty + (th * 1.3)
         if horizontal_close and vertical_close:
             return True
-        if intersection_over_union(person_bbox, table_bbox) >= 0.02:
+        if intersection_over_union(person_bbox, anchor_bbox) >= 0.02:
             return True
     return False
+
+
+def person_is_near_table(person: dict[str, Any], tables: list[dict[str, Any]]) -> bool:
+    return person_is_near_anchor(person, tables)
+
+
+def is_guest_context_detection(detection: dict[str, Any]) -> bool:
+    label = str(detection.get("label") or "").lower()
+    markers = (
+        "dining table",
+        "table",
+        "chair",
+        "bench",
+        "cup",
+        "bottle",
+        "wine glass",
+        "plate",
+        "bowl",
+    )
+    return any(marker in label for marker in markers)
 
 
 def build_restaurant_scene_annotations(inference: dict[str, Any], prompt: str) -> dict[str, Any] | None:
@@ -339,16 +396,22 @@ def build_restaurant_scene_annotations(inference: dict[str, Any], prompt: str) -
     engine_outputs = inference.get("engine_outputs") or {}
     rtdetr_output = engine_outputs.get("rt_detr") or {}
     falcon_output = engine_outputs.get("falcon") or {}
+    sam3_output = engine_outputs.get("sam3") or {}
     candidate_detections = rtdetr_output.get("candidate_detections") or []
 
     people = [det for det in candidate_detections if str(det.get("label") or "").lower() == "person"]
     tables = [det for det in candidate_detections if "table" in str(det.get("label") or "").lower()]
-    falcon_people = falcon_output.get("detections") or []
+    guest_context = [det for det in candidate_detections if is_guest_context_detection(det)]
+    guidance_sources = [
+        ("falcon", falcon_output.get("detections") or []),
+        ("sam3", sam3_output.get("detections") or []),
+    ]
     service_prompt = "service" in prompt.lower()
 
     entities: list[dict[str, Any]] = []
     goer_count = 0
     server_count = 0
+    unclassified_count = 0
     needs_service_count = 0
 
     for index, table in enumerate(tables, start=1):
@@ -364,17 +427,40 @@ def build_restaurant_scene_annotations(inference: dict[str, Any], prompt: str) -
 
     for index, person in enumerate(people, start=1):
         near_table = person_is_near_table(person, tables)
-        needs_service = service_prompt and detection_overlaps(person, falcon_people, threshold=0.18)
+        near_guest_context = person_is_near_anchor(person, guest_context)
+        guidance_source = first_guidance_overlap(person, guidance_sources, threshold=0.18)
+        needs_service = bool(service_prompt and guidance_source)
         if needs_service:
             role = "restaurant_goer"
+            role_reason = "focused_service_guidance"
+            role_confidence = 0.85
+            classification_source = guidance_source or "falcon"
             needs_service_count += 1
             goer_count += 1
         elif near_table:
             role = "restaurant_goer"
+            role_reason = "near_table"
+            role_confidence = 0.70
+            classification_source = "rt_detr"
             goer_count += 1
-        else:
+        elif near_guest_context:
+            role = "restaurant_goer"
+            role_reason = "near_guest_context"
+            role_confidence = 0.55
+            classification_source = "rt_detr"
+            goer_count += 1
+        elif tables:
             role = "server"
+            role_reason = "away_from_guest_tables"
+            role_confidence = 0.50
+            classification_source = "heuristic"
             server_count += 1
+        else:
+            role = "unclassified"
+            role_reason = "insufficient_grounding"
+            role_confidence = 0.0
+            classification_source = "none"
+            unclassified_count += 1
 
         entities.append(
             {
@@ -383,6 +469,10 @@ def build_restaurant_scene_annotations(inference: dict[str, Any], prompt: str) -
                 "role": role,
                 "needs_service": needs_service,
                 "near_table": near_table,
+                "near_guest_context": near_guest_context,
+                "role_reason": role_reason,
+                "role_confidence": role_confidence,
+                "classification_source": classification_source,
                 "bbox": detection_bbox_norm(person),
             }
         )
@@ -393,6 +483,7 @@ def build_restaurant_scene_annotations(inference: dict[str, Any], prompt: str) -
         "counts": {
             "restaurant_goers": goer_count,
             "servers": server_count,
+            "unclassified": unclassified_count,
             "tables": len(tables),
             "needs_service": needs_service_count,
         },
@@ -444,21 +535,25 @@ def falcon_task_for_live_prompt(task: str) -> str:
 class LiveSessionConfig:
     source_url: str = ""
     prompt: str = "people under the umbrellas"
-    task: str = "detection"
-    enable_sam3: bool = False
+    task: str = "segmentation"
+    enable_sam3: bool = True
     min_dim: int = 480
     max_dim: int = 960
     falcon_min_dim: int = 256
     falcon_max_dim: int = 640
     falcon_max_new_tokens: int = 128
     falcon_temperature: float = 0.0
-    falcon_refresh_seconds: float = 2.0
+    falcon_refresh_seconds: float = 5.0
     rtdetr_threshold: float = 0.35
     sam3_threshold: float = 0.5
     sam3_mask_threshold: float = 0.5
     stream_open_timeout: float = 60.0
     stream_read_timeout: float = 20.0
     jpeg_quality: int = 85
+
+    def __post_init__(self) -> None:
+        self.task = "segmentation"
+        self.enable_sam3 = True
 
 
 @dataclass
@@ -473,10 +568,13 @@ class RuntimeOptions:
     device: str = "cuda"
     compile_model: bool = True
     load_rtdetr: bool = True
-    load_sam3: bool = False
+    load_sam3: bool = True
     host: str = "0.0.0.0"
     port: int = 8080
     ui_path: Path = DEFAULT_UI_PATH
+
+    def __post_init__(self) -> None:
+        self.load_sam3 = True
 
 
 @dataclass
@@ -484,6 +582,26 @@ class FalconGuidance:
     inference: dict[str, Any]
     ran_at: float
     frame_id: int
+    prompt_revision: int
+
+
+@dataclass
+class Sam3Guidance:
+    inference: dict[str, Any]
+    ran_at: float
+    frame_id: int
+    prompt_revision: int
+
+
+@dataclass
+class Sam3Request:
+    image: Image.Image
+    query: str
+    prompt_bboxes: list[dict[str, float]]
+    threshold: float
+    mask_threshold: float
+    frame_id: int
+    prompt_revision: int
 
 
 class FalconRealtimeRuntime:
@@ -592,6 +710,11 @@ class FalconPipelineRealtimeService:
         self.latest_frame: np.ndarray | None = None
         self.latest_frame_id = 0
         self.prompt_revision = 0
+        self.latest_falcon_guidance: FalconGuidance | None = None
+        self.latest_falcon_error: str | None = None
+        self.latest_sam3_guidance: Sam3Guidance | None = None
+        self.latest_sam3_error: str | None = None
+        self.latest_sam3_request: Sam3Request | None = None
         self.latest_result: dict[str, Any] = {}
         self.latest_jpeg: bytes = b""
         self.latest_frame_is_placeholder = True
@@ -603,6 +726,12 @@ class FalconPipelineRealtimeService:
             "processed_fps": 0.0,
             "last_processed_at": None,
             "latest_generation_seconds": None,
+            "falcon_guidance_state": "idle",
+            "falcon_guidance_age_seconds": None,
+            "falcon_guidance_generation_seconds": None,
+            "sam3_segmentation_state": "idle",
+            "sam3_segmentation_age_seconds": None,
+            "sam3_segmentation_generation_seconds": None,
         }
         self.processed_timestamps: deque[float] = deque(maxlen=40)
         self.falcon_runtime: FalconRealtimeRuntime | None = None
@@ -616,16 +745,19 @@ class FalconPipelineRealtimeService:
                 "requested": True,
                 "state": "pending",
                 "error": None,
+                "error_kind": None,
             },
             "rt_detr": {
                 "requested": self.options.load_rtdetr,
                 "state": "pending" if self.options.load_rtdetr else "disabled",
                 "error": None,
+                "error_kind": None,
             },
             "sam3": {
                 "requested": self.options.load_sam3,
                 "state": "pending" if self.options.load_sam3 else "disabled",
                 "error": None,
+                "error_kind": None,
             },
         }
         self.threads: list[threading.Thread] = []
@@ -640,6 +772,8 @@ class FalconPipelineRealtimeService:
         self.threads = [
             threading.Thread(target=self._load_models, name="falcon-loader", daemon=True),
             threading.Thread(target=self._capture_loop, name="falcon-capture", daemon=True),
+            threading.Thread(target=self._falcon_guidance_loop, name="falcon-guidance", daemon=True),
+            threading.Thread(target=self._sam3_loop, name="falcon-sam3", daemon=True),
             threading.Thread(target=self._process_loop, name="falcon-process", daemon=True),
         ]
         for thread in self.threads:
@@ -656,11 +790,21 @@ class FalconPipelineRealtimeService:
         with self.lock:
             self.latest_metrics[key] = value
 
-    def _set_model_state(self, name: str, state: str, error: str | None = None) -> None:
+    def _set_model_state(
+        self,
+        name: str,
+        state: str,
+        error: str | None = None,
+        error_kind: str | None = None,
+    ) -> None:
         with self.lock:
             record = self.model_status[name]
             record["state"] = state
             record["error"] = error
+            if state == "error":
+                record["error_kind"] = error_kind or classify_model_load_error_kind(error)
+            else:
+                record["error_kind"] = None
 
     def _set_source_state(self, state: dict[str, Any]) -> None:
         with self.lock:
@@ -686,9 +830,30 @@ class FalconPipelineRealtimeService:
                 return False
         return True
 
+    def _blocking_engine_errors(self, result: dict[str, Any]) -> list[dict[str, Any]]:
+        blocking: list[dict[str, Any]] = []
+        for engine in result.get("engines") or []:
+            if not engine.get("enabled"):
+                continue
+            if engine.get("status") != "error":
+                continue
+            blocking.append(
+                {
+                    "name": str(engine.get("name") or "unknown"),
+                    "reason": (None if engine.get("reason") is None else str(engine.get("reason"))),
+                    "error_kind": (
+                        engine.get("error_kind")
+                        or classify_engine_error_kind(None if engine.get("reason") is None else str(engine.get("reason")))
+                        or ERROR_KIND_INFERENCE_RUNTIME
+                    ),
+                }
+            )
+        return blocking
+
     def _derive_operator_error(
         self,
         *,
+        result: dict[str, Any],
         source: dict[str, Any],
         metrics: dict[str, Any],
         model_status: dict[str, dict[str, Any]],
@@ -701,7 +866,12 @@ class FalconPipelineRealtimeService:
         for name in ("falcon", "rt_detr", "sam3"):
             record = model_status.get(name) or {}
             if record.get("state") == "error" and record.get("error"):
-                return ERROR_KIND_MODEL_LOAD, str(record.get("error"))
+                return str(record.get("error_kind") or ERROR_KIND_MODEL_LOAD), str(record.get("error"))
+
+        for engine_error in self._blocking_engine_errors(result):
+            return str(engine_error.get("error_kind") or ERROR_KIND_INFERENCE_RUNTIME), str(
+                engine_error.get("reason") or f"{engine_error['name']} inference failed"
+            )
 
         pipeline_state = metrics.get("pipeline_state")
         last_error = metrics.get("last_error")
@@ -713,6 +883,7 @@ class FalconPipelineRealtimeService:
     def _derive_service_state(
         self,
         *,
+        result: dict[str, Any],
         session: dict[str, Any],
         metrics: dict[str, Any],
         model_status: dict[str, dict[str, Any]],
@@ -722,18 +893,26 @@ class FalconPipelineRealtimeService:
             return "error"
         if metrics.get("capture_state") == "error":
             return "error"
+        if model_status["sam3"]["state"] == "error":
+            return "error"
         if not self._models_ready(model_status):
             return "warming"
         if not session.get("source_url", "").strip():
             return "idle"
         if metrics.get("capture_state") in {"connecting", "reconnecting"}:
             return "connecting"
-        degraded = model_status["rt_detr"]["state"] == "error" or (
-            bool(session.get("enable_sam3")) and model_status["sam3"]["state"] == "error"
-        )
+        degraded = model_status["rt_detr"]["state"] == "error" or not self._sam3_visual_ready(result, metrics)
+        degraded = degraded or bool(self._blocking_engine_errors(result))
         if frame["ready"]:
             return "degraded" if degraded else "live"
         return "waiting_for_frame"
+
+    def _sam3_visual_ready(self, result: dict[str, Any], metrics: dict[str, Any]) -> bool:
+        if result.get("primary_engine") != "sam3":
+            return False
+        if metrics.get("sam3_segmentation_state") != "ready":
+            return False
+        return bool(result.get("detections") or result.get("masks_rle") or result.get("num_masks"))
 
     def _load_models(self) -> None:
         self._set_metric("pipeline_state", "loading_models")
@@ -779,12 +958,16 @@ class FalconPipelineRealtimeService:
 
         session = self._session_copy()
         if session.source_url.strip():
+            with self.lock:
+                current_stream_info = copy.deepcopy(self.stream_info)
+                capture_state = self.latest_metrics.get("capture_state")
+            source_status = SOURCE_STATUS_READY if capture_state == "running" and current_stream_info else SOURCE_STATUS_RESOLVING
             self._set_source_state(
-                build_source_state(
+                build_source_state_from_stream_info(
                     input_url=session.source_url,
-                    source_type=infer_source_type(session.source_url),
-                    status=SOURCE_STATUS_RESOLVING,
-                    cookie_file_configured=self.options.youtube_cookie_file is not None,
+                    cookie_file=self.options.youtube_cookie_file,
+                    stream_info=current_stream_info,
+                    status=source_status,
                 )
             )
             self._set_metric("pipeline_state", "waiting_for_frame")
@@ -808,20 +991,43 @@ class FalconPipelineRealtimeService:
     def update_session(self, update: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
             source_changed = False
-            prompt_changed = False
+            guidance_changed = False
             for key, value in update.items():
                 if value is None or not hasattr(self.session, key):
                     continue
-                if key == "task" and value not in {"detection", "segmentation"}:
-                    continue
+                if key == "task":
+                    value = "segmentation"
+                elif key == "enable_sam3":
+                    value = True
                 if getattr(self.session, key) != value:
                     setattr(self.session, key, value)
                     source_changed = source_changed or key == "source_url"
-                    prompt_changed = prompt_changed or key == "prompt"
-            if prompt_changed:
+                    guidance_changed = guidance_changed or key in {
+                        "source_url",
+                        "prompt",
+                        "task",
+                        "enable_sam3",
+                        "falcon_min_dim",
+                        "falcon_max_dim",
+                        "falcon_max_new_tokens",
+                        "falcon_temperature",
+                        "sam3_threshold",
+                        "sam3_mask_threshold",
+                    }
+            if guidance_changed:
                 self.prompt_revision += 1
+                self.latest_falcon_guidance = None
+                self.latest_falcon_error = None
+                self.latest_sam3_guidance = None
+                self.latest_sam3_error = None
+                self.latest_sam3_request = None
+                self.latest_metrics["falcon_guidance_state"] = "idle"
+                self.latest_metrics["falcon_guidance_age_seconds"] = None
+                self.session.task = "segmentation"
+                self.session.enable_sam3 = True
+                self.latest_metrics["sam3_segmentation_state"] = "idle"
+                self.latest_metrics["sam3_segmentation_age_seconds"] = None
             if source_changed:
-                self.prompt_revision += 1
                 self.capture_source_key = None
                 self.stream_info = None
                 self.latest_frame = None
@@ -860,12 +1066,17 @@ class FalconPipelineRealtimeService:
                 "bytes": len(self.latest_jpeg),
             }
         error_kind, error_message = self._derive_operator_error(
+            result=result,
             source=source,
             metrics=metrics,
             model_status=model_status,
         )
+        blocking_engine_errors = self._blocking_engine_errors(result)
+        sam3_visual_ready = self._sam3_visual_ready(result, metrics)
+        integration_ready = self._models_ready(model_status) and frame["ready"] and not blocking_engine_errors and sam3_visual_ready
         readiness = {
             "service_state": self._derive_service_state(
+                result=result,
                 session=session,
                 metrics=metrics,
                 model_status=model_status,
@@ -873,7 +1084,10 @@ class FalconPipelineRealtimeService:
             ),
             "models_ready": self._models_ready(model_status),
             "capture_connected": metrics.get("capture_state") == "running",
-            "integration_ready": self._models_ready(model_status) and frame["ready"],
+            "integration_ready": integration_ready,
+            "full_pipeline_ready": integration_ready,
+            "sam3_visual_ready": sam3_visual_ready,
+            "blocking_engine_errors": blocking_engine_errors,
             "error_kind": error_kind,
             "error_message": error_message,
         }
@@ -999,10 +1213,156 @@ class FalconPipelineRealtimeService:
                 read_deadline_started = None
             time.sleep(0.05)
 
+    @staticmethod
+    def _empty_falcon_inference(message: str) -> dict[str, Any]:
+        return {
+            "decoded_output": message,
+            "detections": [],
+            "bboxes": [],
+            "num_masks": 0,
+            "masks_rle": [],
+            "generation_seconds": 0.0,
+        }
+
+    def _falcon_guidance_loop(self) -> None:
+        while not self.stop_event.is_set():
+            with self.lock:
+                frame = None if self.latest_frame is None else self.latest_frame.copy()
+                frame_id = self.latest_frame_id
+                prompt_revision = self.prompt_revision
+                session = copy.deepcopy(self.session)
+                guidance = copy.deepcopy(self.latest_falcon_guidance)
+
+            if frame is None or not session.source_url.strip() or self.falcon_runtime is None:
+                time.sleep(0.05)
+                continue
+
+            refresh_due = (
+                guidance is None
+                or guidance.prompt_revision != prompt_revision
+                or (time.time() - guidance.ran_at) >= max(session.falcon_refresh_seconds, 0.2)
+            )
+            if not refresh_due:
+                time.sleep(0.05)
+                continue
+
+            try:
+                self._set_metric("falcon_guidance_state", "refreshing")
+                pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                model_image = resize_image_to_bounds(
+                    pil_image,
+                    min_dim=session.min_dim,
+                    max_dim=session.max_dim,
+                )
+                assert self.falcon_runtime is not None
+                falcon_inference = self.falcon_runtime.run(
+                    image=model_image,
+                    query=session.prompt,
+                    task=falcon_task_for_live_prompt(session.task),
+                    min_dim=session.falcon_min_dim,
+                    max_dim=session.falcon_max_dim,
+                    max_new_tokens=session.falcon_max_new_tokens,
+                    temperature=session.falcon_temperature,
+                )
+                guidance = FalconGuidance(
+                    inference=falcon_inference,
+                    ran_at=time.time(),
+                    frame_id=frame_id,
+                    prompt_revision=prompt_revision,
+                )
+                with self.lock:
+                    self.latest_falcon_guidance = guidance
+                    self.latest_falcon_error = None
+                    self.latest_metrics["falcon_guidance_state"] = "ready"
+                    self.latest_metrics["falcon_guidance_age_seconds"] = 0.0
+                    self.latest_metrics["falcon_guidance_generation_seconds"] = falcon_inference.get("generation_seconds")
+            except Exception as exc:
+                with self.lock:
+                    self.latest_falcon_error = str(exc)
+                    self.latest_metrics["falcon_guidance_state"] = "error"
+                    if self.latest_falcon_guidance is None:
+                        self.latest_metrics["last_error"] = f"Falcon refresh failed: {exc}"
+                time.sleep(0.25)
+
+    def _queue_sam3_request(
+        self,
+        *,
+        image: Image.Image,
+        session: LiveSessionConfig,
+        prompt_bboxes: list[dict[str, float]],
+        frame_id: int,
+        prompt_revision: int,
+    ) -> None:
+        if not prompt_bboxes:
+            return
+        request = Sam3Request(
+            image=image.copy(),
+            query=session.prompt,
+            prompt_bboxes=copy.deepcopy(prompt_bboxes),
+            threshold=session.sam3_threshold,
+            mask_threshold=session.sam3_mask_threshold,
+            frame_id=frame_id,
+            prompt_revision=prompt_revision,
+        )
+        with self.lock:
+            self.latest_sam3_request = request
+            if self.latest_metrics.get("sam3_segmentation_state") in {"disabled", "idle"}:
+                self.latest_metrics["sam3_segmentation_state"] = "queued"
+
+    def _sam3_loop(self) -> None:
+        last_started_key: tuple[int, int] | None = None
+        while not self.stop_event.is_set():
+            with self.lock:
+                request = copy.deepcopy(self.latest_sam3_request)
+                session = copy.deepcopy(self.session)
+
+            if self.sam3_runtime is None:
+                self._set_metric("sam3_segmentation_state", "unavailable")
+                time.sleep(0.10)
+                continue
+
+            if request is None:
+                self._set_metric("sam3_segmentation_state", "waiting_for_boxes")
+                time.sleep(0.05)
+                continue
+
+            request_key = (request.prompt_revision, request.frame_id)
+            if request_key == last_started_key:
+                time.sleep(0.03)
+                continue
+
+            last_started_key = request_key
+            try:
+                self._set_metric("sam3_segmentation_state", "segmenting")
+                assert self.sam3_runtime is not None
+                sam3_inference = run_sam3_inference(
+                    runtime=self.sam3_runtime,
+                    image=request.image,
+                    query=request.query,
+                    prompt_bboxes=request.prompt_bboxes,
+                    threshold=request.threshold,
+                    mask_threshold=request.mask_threshold,
+                )
+                guidance = Sam3Guidance(
+                    inference=sam3_inference,
+                    ran_at=time.time(),
+                    frame_id=request.frame_id,
+                    prompt_revision=request.prompt_revision,
+                )
+                with self.lock:
+                    self.latest_sam3_guidance = guidance
+                    self.latest_sam3_error = None
+                    self.latest_metrics["sam3_segmentation_state"] = "ready"
+                    self.latest_metrics["sam3_segmentation_age_seconds"] = 0.0
+                    self.latest_metrics["sam3_segmentation_generation_seconds"] = sam3_inference.get("generation_seconds")
+            except Exception as exc:
+                with self.lock:
+                    self.latest_sam3_error = str(exc)
+                    self.latest_metrics["sam3_segmentation_state"] = "error"
+                time.sleep(0.25)
+
     def _process_loop(self) -> None:
         last_processed_frame_id = -1
-        last_prompt_revision = -1
-        falcon_guidance: FalconGuidance | None = None
 
         while not self.stop_event.is_set():
             with self.lock:
@@ -1010,6 +1370,10 @@ class FalconPipelineRealtimeService:
                 frame_id = self.latest_frame_id
                 prompt_revision = self.prompt_revision
                 session = copy.deepcopy(self.session)
+                falcon_guidance = copy.deepcopy(self.latest_falcon_guidance)
+                falcon_error = self.latest_falcon_error
+                sam3_guidance = copy.deepcopy(self.latest_sam3_guidance)
+                sam3_error = self.latest_sam3_error
 
             if frame is None or not session.source_url.strip():
                 time.sleep(0.05)
@@ -1023,11 +1387,8 @@ class FalconPipelineRealtimeService:
                 time.sleep(0.01)
                 continue
 
-            if prompt_revision != last_prompt_revision:
-                falcon_guidance = None
-                last_prompt_revision = prompt_revision
-
             try:
+                frame_processing_start = time.perf_counter()
                 pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 model_image = resize_image_to_bounds(
                     pil_image,
@@ -1035,42 +1396,15 @@ class FalconPipelineRealtimeService:
                     max_dim=session.max_dim,
                 )
 
-                falcon_refresh_due = (
-                    falcon_guidance is None
-                    or (time.time() - falcon_guidance.ran_at) >= max(session.falcon_refresh_seconds, 0.2)
-                )
-                falcon_error: str | None = None
-                if falcon_refresh_due:
-                    try:
-                        assert self.falcon_runtime is not None
-                        falcon_inference = self.falcon_runtime.run(
-                            image=model_image,
-                            query=session.prompt,
-                            task=falcon_task_for_live_prompt(session.task),
-                            min_dim=session.falcon_min_dim,
-                            max_dim=session.falcon_max_dim,
-                            max_new_tokens=session.falcon_max_new_tokens,
-                            temperature=session.falcon_temperature,
-                        )
-                        falcon_guidance = FalconGuidance(
-                            inference=falcon_inference,
-                            ran_at=time.time(),
-                            frame_id=frame_id,
-                        )
-                    except Exception as exc:
-                        falcon_error = str(exc)
+                if falcon_guidance is not None and falcon_guidance.prompt_revision != prompt_revision:
+                    falcon_guidance = None
+                if sam3_guidance is not None and sam3_guidance.prompt_revision != prompt_revision:
+                    sam3_guidance = None
 
                 falcon_inference = (
                     falcon_guidance.inference
                     if falcon_guidance is not None
-                    else {
-                        "decoded_output": "Falcon guidance unavailable for this frame.",
-                        "detections": [],
-                        "bboxes": [],
-                        "num_masks": 0,
-                        "masks_rle": [],
-                        "generation_seconds": 0.0,
-                    }
+                    else self._empty_falcon_inference("Falcon guidance is warming up; using detector-only frame updates.")
                 )
 
                 rtdetr_inference = None
@@ -1088,45 +1422,44 @@ class FalconPipelineRealtimeService:
                     except Exception as exc:
                         rtdetr_error = str(exc)
 
-                sam3_inference = None
-                sam3_error = self.sam3_load_error
-                if session.enable_sam3 and session.task == "segmentation":
-                    prompt_boxes = (
-                        rtdetr_inference.get("bboxes")
-                        or falcon_inference.get("bboxes")
-                        or []
+                sam3_inference = None if sam3_guidance is None else sam3_guidance.inference
+                sam3_error = sam3_error or self.sam3_load_error
+                prompt_boxes = (
+                    (rtdetr_inference or {}).get("bboxes")
+                    or falcon_inference.get("bboxes")
+                    or []
+                )
+                if self.sam3_runtime is None:
+                    sam3_error = sam3_error or "SAM 3 runtime is unavailable."
+                else:
+                    self._queue_sam3_request(
+                        image=model_image,
+                        session=session,
+                        prompt_bboxes=prompt_boxes,
+                        frame_id=frame_id,
+                        prompt_revision=prompt_revision,
                     )
-                    if self.sam3_runtime is None:
-                        sam3_error = sam3_error or "SAM 3 runtime is unavailable."
-                    else:
-                        sam3_inference = run_sam3_inference(
-                            runtime=self.sam3_runtime,
-                            image=model_image,
-                            query=session.prompt,
-                            prompt_bboxes=prompt_boxes,
-                            threshold=session.sam3_threshold,
-                            mask_threshold=session.sam3_mask_threshold,
-                        )
+                    if sam3_inference is None:
+                        sam3_error = sam3_error or "SAM 3 segmentation is warming up."
+
+                if falcon_guidance is None:
+                    effective_falcon_error = falcon_error or "Falcon guidance is warming up."
+                elif falcon_error is None:
+                    effective_falcon_error = None
+                else:
+                    effective_falcon_error = f"Latest Falcon refresh failed; using prior guidance. {falcon_error}"
 
                 result = build_orchestrated_inference(
                     query=session.prompt,
                     falcon_inference=falcon_inference,
                     falcon_model_id=self.options.falcon_model_id,
                     falcon_device=self.options.device,
-                    falcon_error=(
-                        falcon_error
-                        if falcon_guidance is None
-                        else (
-                            None
-                            if falcon_error is None
-                            else f"Latest Falcon refresh failed; using prior guidance. {falcon_error}"
-                        )
-                    ),
+                    falcon_error=effective_falcon_error,
                     rtdetr_inference=rtdetr_inference,
                     rtdetr_model_id=(self.options.rtdetr_model_id if self.options.load_rtdetr else None),
                     rtdetr_error=rtdetr_error,
                     sam3_inference=sam3_inference,
-                    sam3_model_id=(self.options.sam3_model_id if session.enable_sam3 else None),
+                    sam3_model_id=self.options.sam3_model_id,
                     sam3_error=sam3_error,
                 )
                 scene_annotations = build_restaurant_scene_annotations(result, session.prompt)
@@ -1134,6 +1467,12 @@ class FalconPipelineRealtimeService:
                     result["scene_annotations"] = scene_annotations
                 if falcon_guidance is not None:
                     result["falcon_guidance_age_seconds"] = round(time.time() - falcon_guidance.ran_at, 3)
+                    result["falcon_guidance_frame_id"] = falcon_guidance.frame_id
+                if sam3_guidance is not None:
+                    result["sam3_segmentation_age_seconds"] = round(time.time() - sam3_guidance.ran_at, 3)
+                    result["sam3_segmentation_frame_id"] = sam3_guidance.frame_id
+                result["frame_generation_seconds"] = time.perf_counter() - frame_processing_start
+                result["generation_seconds"] = result["frame_generation_seconds"]
 
                 overlay_bgr = self._render_overlay(frame, result, session)
                 self.processed_timestamps.append(time.time())
@@ -1143,7 +1482,11 @@ class FalconPipelineRealtimeService:
                     if elapsed > 0:
                         fps = (len(self.processed_timestamps) - 1) / elapsed
                 self._set_metric("processed_fps", round(fps, 2))
-                self._set_metric("last_error", falcon_error if falcon_guidance is None else None)
+                self._set_metric("last_error", effective_falcon_error if falcon_guidance is None else None)
+                if falcon_guidance is not None:
+                    self._set_metric("falcon_guidance_age_seconds", round(time.time() - falcon_guidance.ran_at, 3))
+                if sam3_guidance is not None:
+                    self._set_metric("sam3_segmentation_age_seconds", round(time.time() - sam3_guidance.ran_at, 3))
                 self._set_latest_overlay(overlay_bgr, result)
                 last_processed_frame_id = frame_id
             except Exception as exc:
@@ -1193,6 +1536,7 @@ class FalconPipelineRealtimeService:
                 "Restaurant mode: "
                 f"goers {counts.get('restaurant_goers', 0)}   "
                 f"servers {counts.get('servers', 0)}   "
+                f"unclassified {counts.get('unclassified', 0)}   "
                 f"tables {counts.get('tables', 0)}   "
                 f"needs service {counts.get('needs_service', 0)}"
             )
@@ -1371,11 +1715,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", type=str, default="people under the umbrellas", help="Initial Falcon prompt.")
     parser.add_argument(
         "--task",
-        choices=("detection", "segmentation"),
-        default="detection",
-        help="Primary live task mode.",
+        choices=("segmentation",),
+        default="segmentation",
+        help="Primary live task mode. SAM 3 segmentation is mandatory for this service.",
     )
-    parser.add_argument("--enable-sam3", action="store_true", help="Enable SAM 3 by default in the UI session.")
+    parser.add_argument("--enable-sam3", action="store_true", default=True, help=argparse.SUPPRESS)
     parser.add_argument("--falcon-model-id", default=PERCEPTION_300M_MODEL_ID, help="Falcon Perception model id.")
     parser.add_argument("--rtdetr-model-id", default=DEFAULT_RT_DETR_MODEL_ID, help="RT-DETR model id.")
     parser.add_argument("--sam3-model-id", default=DEFAULT_SAM3_MODEL_ID, help="SAM 3 model id.")
@@ -1402,16 +1746,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ui-path", type=Path, default=DEFAULT_UI_PATH, help="HTML UI file to serve.")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile for Falcon.")
     parser.add_argument("--no-load-rtdetr", action="store_true", help="Skip loading RT-DETR at startup.")
-    sam3_group = parser.add_mutually_exclusive_group()
-    sam3_group.add_argument("--load-sam3", dest="load_sam3", action="store_true", help="Preload SAM 3 at startup.")
-    sam3_group.add_argument("--no-load-sam3", dest="load_sam3", action="store_false", help=argparse.SUPPRESS)
-    parser.set_defaults(load_sam3=False)
+    parser.add_argument("--load-sam3", dest="load_sam3", action="store_true", default=True, help=argparse.SUPPRESS)
     parser.add_argument("--min-dim", type=int, default=480, help="Shortest side used for live detector frames.")
     parser.add_argument("--max-dim", type=int, default=960, help="Longest side used for live detector frames.")
     parser.add_argument("--falcon-min-dim", type=int, default=256, help="Shortest side for Falcon refresh passes.")
     parser.add_argument("--falcon-max-dim", type=int, default=640, help="Longest side for Falcon refresh passes.")
     parser.add_argument("--falcon-max-new-tokens", type=int, default=128, help="Falcon max new tokens per refresh.")
-    parser.add_argument("--falcon-refresh-seconds", type=float, default=2.0, help="Seconds between Falcon refreshes.")
+    parser.add_argument("--falcon-refresh-seconds", type=float, default=5.0, help="Seconds between Falcon refreshes.")
     return parser.parse_args()
 
 
@@ -1441,7 +1782,7 @@ def main() -> int:
         device=args.device,
         compile_model=not args.no_compile,
         load_rtdetr=not args.no_load_rtdetr,
-        load_sam3=args.load_sam3,
+        load_sam3=True,
         host=args.host,
         port=args.port,
         ui_path=args.ui_path.expanduser().resolve(),
@@ -1449,8 +1790,8 @@ def main() -> int:
     session = LiveSessionConfig(
         source_url=args.source_url,
         prompt=args.prompt,
-        task=args.task,
-        enable_sam3=args.enable_sam3,
+        task="segmentation",
+        enable_sam3=True,
         min_dim=args.min_dim,
         max_dim=args.max_dim,
         falcon_min_dim=args.falcon_min_dim,

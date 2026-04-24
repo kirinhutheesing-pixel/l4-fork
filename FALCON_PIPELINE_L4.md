@@ -8,7 +8,7 @@ The first milestone is intentionally narrow:
 - Docker as the runtime
 - one public YouTube live stream
 - `Falcon-Perception-300M` + `RT-DETR`
-- `SAM 3` off by default
+- `SAM 3` always loaded and required
 - private access through an SSH tunnel only
 
 The first integration surface for other programs is:
@@ -19,20 +19,47 @@ The first integration surface for other programs is:
 
 The intended default runtime is:
 - Falcon model: `tiiuae/Falcon-Perception-300M`
-- Task: `detection`
+- Task: `segmentation`
 - RT-DETR: enabled
-- SAM 3: disabled unless explicitly requested
+- SAM 3: enabled and required
 - `max_dim=960`
-- `falcon_refresh_seconds=2.0`
+- `falcon_refresh_seconds=5.0`
 
-## Proven values on 2026-04-22
+## SAM 3 realtime concept
 
-These are not product requirements, but they are the last known-good operator values from the live L4 bring-up:
+The supported bring-up is now the SAM 3 segmentation view:
+- RT-DETR runs on live frames and supplies fast person/object boxes
+- Falcon runs in a background guidance loop and refreshes slower natural-language context
+- SAM 3 is always loaded by the service and is not an operator toggle
+- when SAM 3 returns masks, `primary_engine` becomes `sam3` and `/api/frame.jpg` shows the SAM 3 mask overlay
+- while SAM 3 is loading or segmenting, the service can still show RT-DETR/Falcon-backed frames, but `/api/state` keeps `full_pipeline_ready=false` until SAM 3 is healthy and visibly primary
+
+Use `/api/state` to confirm the active visual path:
+- `result.primary_engine = "sam3"` means the visible overlay is currently SAM 3-driven
+- `metrics.sam3_segmentation_state = "ready"` means a SAM 3 result is available
+- `readiness.sam3_visual_ready = true` means the integration contract sees SAM 3 as the visible output
+- `result.sam3_segmentation_age_seconds` tells how stale the visible SAM 3 mask is
+- `readiness.blocking_engine_errors` should be empty for a fully ready SAM 3 run
+
+## Proven values on 2026-04-22 through 2026-04-24
+
+These are not product requirements, but they are the last known operator values observed during live L4 bring-up:
 - local account: `kirin@lifelineus.com`
 - project: `tableminder`
 - instance name: `falcon-pipeline-l4`
-- first successful allocation zone: `us-east4-c`
-- capacity note: `us-central1-a`, `us-central1-b`, `us-central1-c`, and `us-east4-a` were exhausted for `g2-standard-8` + `1 x NVIDIA L4`
+- successful allocation zones:
+  - `us-east4-c` on 2026-04-22
+  - `us-east4-c` on 2026-04-24
+  - `us-west4-c` on 2026-04-23
+- capacity note:
+  - `us-east4-c`, `us-east1-c`, and `us-east1-b` were exhausted on 2026-04-23
+  - `us-central1-a`, `us-central1-b`, `us-central1-c`, and `us-east4-a` were exhausted on the prior bring-up
+- live source note:
+  - `https://www.youtube.com/watch?v=S605ycm0Vlk` preflighted as `source.status = "ready"` without cookies on 2026-04-23
+  - the same stream still resolved without cookies on 2026-04-24 during a segmentation-mode run
+- SAM 3 note:
+  - launching SAM 3 without approved Hugging Face access to `facebook/sam3` left the service streaming but not fully ready
+  - the live blocker was model auth, not CUDA, OpenCV, or YouTube
 
 If the preferred zone is exhausted again, retry another L4-capable zone before changing the runtime design.
 
@@ -44,8 +71,24 @@ If the preferred zone is exhausted again, retry another L4-capable zone before c
 - `requirements-gcp-l4.txt`: Docker and VM Python dependencies
 - `scripts/gcp/create_l4_vm.ps1`: zone-retrying VM create + bootstrap/GPU validation
 - `scripts/gcp/delete_l4_vm.ps1`: verified teardown for instance + same-name boot disk
+- `scripts/gcp/status_l4_vm.ps1`: read-only VM, GPU, container, API, and log summary
 - `scripts/gcp/run_realtime_service.sh`: source preflight + container launch
 - `scripts/gcp/check_realtime_service.sh`: host/Docker/API smoke check
+
+## Agent quick start
+
+When returning to this repo after a prior run, start with:
+
+```powershell
+cd "C:\Users\kirin\OneDrive\Documents\Playground\L4 Fork"
+$env:CLOUDSDK_CONFIG = "$PWD\.gcloud-config-l4-lifeline"
+$env:PROJECT_ID = "tableminder"
+$env:ZONE = "us-east4-c"
+$env:VM_NAME = "falcon-pipeline-l4"
+pwsh -File .\scripts\gcp\status_l4_vm.ps1 -ProjectId $env:PROJECT_ID -Zone $env:ZONE -VmName $env:VM_NAME
+```
+
+That script is read-only. It reports local `gcloud` context, VM/disk status, host GPU, Docker GPU, container state, `/api/healthz`, summarized `/api/state`, and recent container logs.
 
 ## 1. Prepare the local gcloud context
 
@@ -155,6 +198,8 @@ Notes:
 - model weights are downloaded at runtime into `/opt/falcon-pipeline/hf-cache`
 - overlay outputs and artifacts stay under `/opt/falcon-pipeline/outputs`
 - neither weights nor outputs are baked into the image
+- the image must include `build-essential` and `python3-dev` for Falcon/Triton helper compilation
+- if Falcon logs mention `Failed to find C compiler` or `Python.h: No such file or directory`, rebuild from the current repo before debugging anything else
 
 ## 5. Launch the service
 
@@ -170,6 +215,8 @@ export HF_TOKEN="hf_..."
 
 If that channel is not live when you test, replace it with any current public YouTube live URL.
 
+On 2026-04-23 the specific stream `https://www.youtube.com/watch?v=S605ycm0Vlk` resolved cleanly without cookies, so do not assume cookies are always required for public video IDs.
+
 Preferred path on the VM:
 
 ```bash
@@ -181,9 +228,21 @@ What `run_realtime_service.sh` does:
 - runs the service image in `--preflight-only` mode first
 - exits `20` on source auth failures
 - exits `21` on unavailable/unplayable sources
+- exits `22` when no Hugging Face token is present, because SAM 3 is mandatory
 - launches the long-running container only after preflight succeeds
 - defaults to `--no-compile`
 - mounts the cookie file only when `YTDLP_COOKIES_FILE` is set
+
+Optional runtime environment toggles:
+- `FALCON_REFRESH_SECONDS`: defaults to `5.0`
+- `FALCON_MIN_DIM`, `FALCON_MAX_DIM`, `FALCON_MAX_NEW_TOKENS`
+- `MIN_DIM`, `MAX_DIM`
+
+Important:
+- YouTube cookies and Hugging Face model access are separate concerns
+- `cookies.txt` only fixes bot-gated YouTube ingest
+- it does not fix a gated SAM 3 checkpoint
+- always provide an `HF_TOKEN` that has approved access to `facebook/sam3`
 
 If a YouTube stream is bot-gated, export a Netscape-format `cookies.txt` from a signed-in browser and mount it into the container:
 
@@ -203,13 +262,13 @@ The cookie-backed form is also the correct fallback for streams that fail with:
 
 Cookie export and copy instructions are documented in `YOUTUBE_COOKIES.md`.
 
-This launch uses the intended first-milestone defaults:
+This launch uses the intended runtime:
 - `Falcon-Perception-300M`
-- `task=detection`
+- `task=segmentation`
 - `RT-DETR` loaded
-- `SAM 3` not loaded
+- `SAM 3` loaded and required
 
-`HF_TOKEN` is optional if the model path is fully public, but include it for first bring-up so gated downloads or rate limits do not become the blocker.
+The April 24 live run proved that source ingest, Falcon, and RT-DETR can work while SAM 3 is blocked by Hugging Face access. After this change, that state is treated as a hard runtime blocker, not an optional degradation.
 
 ## 6. Tunnel the service locally
 
@@ -261,6 +320,12 @@ Watch these fields:
 - `frame.capture_has_frame`
 - `model_status.falcon.state`
 - `model_status.rt_detr.state`
+- `result.engines`
+- `result.engines[*].status`
+- `result.engines[*].reason`
+- `result.engines[*].error_kind`
+- `result.scene_annotations.entities[*].role_reason`
+- `result.scene_annotations.entities[*].classification_source`
 - `rtdetr_available`
 - `sam3_available`
 - `metrics.capture_state`
@@ -283,12 +348,34 @@ Expected progression:
 3. Live:
    - `readiness.service_state = "live"`
    - `readiness.integration_ready = true`
+   - `readiness.full_pipeline_ready = true`
+   - `readiness.blocking_engine_errors = []`
    - `source.status = "ready"`
    - `frame.state = "live"`
    - `frame.is_placeholder = false`
    - `frame.ready = true`
    - `rtdetr_available = true`
    - `sam3_available = false`
+
+3a. Degraded live frame:
+   - `readiness.service_state = "degraded"`
+   - `frame.ready = true`
+   - `readiness.full_pipeline_ready = false`
+   - `readiness.blocking_engine_errors` is non-empty
+   - this means the service is producing a real frame, but at least one enabled engine is still failing
+
+3b. Full Falcon proof:
+   - `readiness.full_pipeline_ready = true`
+   - `result.engines[]` contains `falcon` with `status != "error"`
+   - `result.engines[]` contains `rt-detr` with `status = "ok"`
+   - `readiness.blocking_engine_errors = []`
+   - `metrics.last_error = null`
+
+Important:
+- `readiness.service_state = "live"` plus `frame.ready = true` only proves the service is producing a real frame
+- it does not prove Falcon guidance is healthy, because RT-DETR can keep the service live on its own
+- use `readiness.full_pipeline_ready` as the first pass/fail gate
+- use `result.engines[*].status` and `result.engines[*].reason` as the final proof surface for engine-specific diagnosis
 
 4. Explicit source block:
    - `source.status = "auth_required"` with `readiness.error_kind = "source_auth"`
@@ -368,6 +455,13 @@ If `/api/healthz` works but `/api/state` stays in `warming`:
 - wait for the first model download to finish
 - inspect container logs for Hugging Face download or model-load errors
 - if you skipped `HF_TOKEN`, retry with it set
+- if `model_status.sam3.error_kind = "model_access"`, this is a gated Hugging Face checkpoint, not a stream problem
+
+If `/api/state` says `service_state = "degraded"` or `full_pipeline_ready = false` while a real frame exists:
+- inspect `readiness.blocking_engine_errors`
+- inspect `result.engines[*]`
+- treat `result.engines[].status = "error"` for `falcon` as a real pipeline failure
+- treat `result.engines[].status = "error"` for `sam3` as a real segmentation failure because SAM 3 is mandatory
 
 If `/api/state` shows `capture_state = "error"`:
 - the source URL is not currently usable
@@ -382,15 +476,32 @@ If `/api/state` shows `source.status = "auth_required"`:
 
 If `/api/frame.jpg` stays placeholder:
 - confirm `readiness.integration_ready` in `/api/state`
- - confirm `source.status = "ready"`
+- confirm `source.status = "ready"`
 - confirm `frame.capture_has_frame = true`
 - confirm `model_status.falcon.state = "loaded"`
 - confirm `model_status.rt_detr.state = "loaded"`
+
+If the frame is live but everyone is `unclassified`:
+- inspect `result.scene_annotations.counts`
+- inspect `result.engine_outputs.falcon.detections`
+- inspect `result.engine_outputs.rt_detr.candidate_detections`
+- inspect `result.scene_annotations.entities[*].role_reason`
+- on the April 24 Hogs Breath run, Falcon returned one full-frame prompt box and RT-DETR found no tables, so the restaurant heuristic had no safe role grounding
+- current hardening ignores full-frame guidance boxes and records why each person is classified or left `unclassified`
 
 If Falcon loads but later fails during inference:
 - retry with `--no-compile`
 - confirm the runtime includes the current compile-fallback changes in `falcon_perception/attention.py`
 - inspect `/api/state` for `result.engines[*].reason`
+
+If Falcon logs `Failed to find C compiler`:
+- the image is missing compiler tooling
+- rebuild with `build-essential`
+
+If Falcon logs `Python.h: No such file or directory`:
+- the image is missing Python C headers
+- rebuild with `python3-dev`
+- do not keep debugging Triton, RT-DETR, or YouTube until that image dependency is fixed
 
 If a Windows-to-VM file copy fails:
 - re-run `gcloud compute ssh ... --command='pwd; ls -la /home/$USER/l4-fork'`

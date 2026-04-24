@@ -367,18 +367,9 @@
             <textarea id="prompt" name="prompt" placeholder="people under the blue umbrellas on the left"></textarea>
           </div>
 
-          <div class="dual">
-            <div class="field">
-              <label for="task">Mode</label>
-              <select id="task" name="task">
-                <option value="detection">Detection</option>
-                <option value="segmentation">Segmentation</option>
-              </select>
-            </div>
-            <div class="toggle">
-              <input id="enableSam3" name="enable_sam3" type="checkbox">
-              <label for="enableSam3">Use SAM 3 for live mask refinement</label>
-            </div>
+          <div class="field">
+            <label for="runtimeMode">Runtime</label>
+            <input id="runtimeMode" type="text" value="SAM 3 segmentation required" disabled>
           </div>
 
           <div class="dual">
@@ -388,7 +379,7 @@
             </div>
             <div class="field">
               <label for="falconRefresh">Falcon Refresh Seconds</label>
-              <input id="falconRefresh" name="falcon_refresh_seconds" type="number" min="0.2" step="0.1" value="2.0">
+              <input id="falconRefresh" name="falcon_refresh_seconds" type="number" min="0.2" step="0.1" value="5.0">
             </div>
           </div>
 
@@ -398,7 +389,7 @@
           </div>
         </form>
         <div class="notes">
-          This service keeps the video feed continuous in the browser and drops stale frames internally so the GPU always works on the freshest view instead of walking through a backlog.
+          SAM 3 segmentation must be loaded at service startup. In segmentation mode, RT-DETR supplies live boxes, Falcon refreshes guidance in the background, and SAM 3 becomes the visible overlay once masks are ready.
         </div>
         <div class="status-line" id="statusLine">Loading runtime state...</div>
       </section>
@@ -488,10 +479,9 @@
 
       document.getElementById("sourceUrl").value = session.source_url || "";
       document.getElementById("prompt").value = session.prompt || "";
-      document.getElementById("task").value = session.task || "detection";
-      document.getElementById("enableSam3").checked = Boolean(session.enable_sam3);
+      document.getElementById("runtimeMode").value = `${(session.task || "segmentation").toUpperCase()} / SAM 3 required`;
       document.getElementById("maxDim").value = session.max_dim || 960;
-      document.getElementById("falconRefresh").value = session.falcon_refresh_seconds || 2.0;
+      document.getElementById("falconRefresh").value = session.falcon_refresh_seconds || 5.0;
 
       document.getElementById("metricEngine").textContent = primaryEngine;
       document.getElementById("metricCount").textContent = metricText(detections.length, "0");
@@ -501,8 +491,15 @@
 
       const streamTitle = state.stream && (state.stream.title || state.stream.requested_url) ? `Source: ${state.stream.title || state.stream.requested_url}` : "Source: not connected yet";
       const errorLine = metrics.last_error ? ` | Alert: ${metrics.last_error}` : "";
-      const sam3Line = state.sam3_available ? "SAM 3 ready" : (state.sam3_load_error ? `SAM 3 unavailable: ${state.sam3_load_error}` : "SAM 3 not loaded");
-      document.getElementById("statusLine").textContent = `${streamTitle} | ${sam3Line}${errorLine}`;
+      const readiness = state.readiness || {};
+      const sam3State = metrics.sam3_segmentation_state || (state.sam3_available ? "loaded" : "not-loaded");
+      const sam3Age = result.sam3_segmentation_age_seconds === null || result.sam3_segmentation_age_seconds === undefined
+        ? ""
+        : `, age ${Number(result.sam3_segmentation_age_seconds).toFixed(1)}s`;
+      const sam3Line = state.sam3_available
+        ? `SAM 3 ${sam3State}${sam3Age}`
+        : (state.sam3_load_error ? `SAM 3 unavailable: ${state.sam3_load_error}` : "SAM 3 loading or unavailable");
+      document.getElementById("statusLine").textContent = `${streamTitle} | Visual: ${primaryEngine} | ${sam3Line} | Ready: ${readiness.full_pipeline_ready === true}${errorLine}`;
 
       renderGuidelines(state.guidelines || []);
       renderDetections(detections);
@@ -529,8 +526,6 @@
       await sendUpdate({
         source_url: document.getElementById("sourceUrl").value.trim(),
         prompt: document.getElementById("prompt").value.trim(),
-        task: document.getElementById("task").value,
-        enable_sam3: document.getElementById("enableSam3").checked,
         max_dim: Number(document.getElementById("maxDim").value),
         falcon_refresh_seconds: Number(document.getElementById("falconRefresh").value),
       });
@@ -539,8 +534,6 @@
     applyPromptOnly.addEventListener("click", async () => {
       await sendUpdate({
         prompt: document.getElementById("prompt").value.trim(),
-        task: document.getElementById("task").value,
-        enable_sam3: document.getElementById("enableSam3").checked,
         falcon_refresh_seconds: Number(document.getElementById("falconRefresh").value),
       });
     });

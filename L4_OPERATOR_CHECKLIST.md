@@ -16,8 +16,9 @@ Set the current shell:
 ```powershell
 $env:CLOUDSDK_CONFIG = "$PWD\.gcloud-config-l4-lifeline"
 $env:PROJECT_ID = "tableminder"
-$env:ZONE = "us-east4-c"
+$env:ZONE = "us-west4-c"
 $env:VM_NAME = "falcon-pipeline-l4"
+$env:HF_TOKEN = "hf_..."
 ```
 
 Quick checks:
@@ -30,6 +31,17 @@ gcloud config get-value project
 Expected:
 - account = `kirin@lifelineus.com`
 - project = `tableminder`
+
+Latest observed success:
+- `us-east4-c` on 2026-04-24
+- `us-west4-c` on 2026-04-23
+- `us-east4-c` on 2026-04-22
+
+Agent status check for an existing VM:
+
+```powershell
+pwsh -File .\scripts\gcp\status_l4_vm.ps1 -ProjectId $env:PROJECT_ID -Zone $env:ZONE -VmName $env:VM_NAME
+```
 
 ## 2. Create the VM
 
@@ -55,21 +67,38 @@ gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --str
 ## 4. Start the service
 
 ```powershell
-gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --strict-host-key-checking=no --command='cd /home/kirin/l4-fork && TEST_SOURCE_URL="YOUR_STREAM_URL" TEST_PROMPT="YOUR_PROMPT" bash scripts/gcp/run_realtime_service.sh'
+gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --strict-host-key-checking=no --command='cd /home/kirin/l4-fork && TEST_SOURCE_URL="YOUR_STREAM_URL" TEST_PROMPT="YOUR_PROMPT" HF_TOKEN="YOUR_APPROVED_HF_TOKEN" bash scripts/gcp/run_realtime_service.sh'
 ```
 
 Cookie-backed YouTube form:
 
 ```powershell
-gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --strict-host-key-checking=no --command='cd /home/kirin/l4-fork && TEST_SOURCE_URL="YOUR_STREAM_URL" TEST_PROMPT="YOUR_PROMPT" YTDLP_COOKIES_FILE="/opt/falcon-pipeline/youtube-cookies.txt" bash scripts/gcp/run_realtime_service.sh'
+gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --strict-host-key-checking=no --command='cd /home/kirin/l4-fork && TEST_SOURCE_URL="YOUR_STREAM_URL" TEST_PROMPT="YOUR_PROMPT" HF_TOKEN="YOUR_APPROVED_HF_TOKEN" YTDLP_COOKIES_FILE="/opt/falcon-pipeline/youtube-cookies.txt" bash scripts/gcp/run_realtime_service.sh'
 ```
 
 `run_realtime_service.sh` always:
 - runs a source preflight first
 - exits `20` on source auth failures
 - exits `21` on unavailable/unplayable sources
+- exits `22` if `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` is missing
 - launches the container with `--no-compile`
 - mounts the cookie file only when `YTDLP_COOKIES_FILE` is set
+
+Current required runtime:
+- `task=segmentation`
+- `SAM 3` always loaded
+- `RT-DETR` supplies live prompt boxes
+- `HF_TOKEN` must already have approved access to `facebook/sam3`
+
+Useful optional launcher env vars:
+- `FALCON_REFRESH_SECONDS=5.0`
+
+Confirm `/api/state` before judging the screen:
+- `result.primary_engine = "sam3"`
+- `metrics.sam3_segmentation_state = "ready"`
+- `readiness.sam3_visual_ready = true`
+- `readiness.full_pipeline_ready = true`
+- `readiness.blocking_engine_errors = []`
 
 ## 5. Verify runtime
 
@@ -80,11 +109,27 @@ gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --str
 Healthy live target:
 - `healthz.status = ok`
 - `readiness.service_state = live`
+- `readiness.full_pipeline_ready = true`
+- `readiness.sam3_visual_ready = true`
+- `readiness.blocking_engine_errors = []`
+- `source.status = ready`
 - `frame.ready = true`
 
 Structured blocked target:
 - `source.status = auth_required` with `readiness.error_kind = source_auth`
 - or `source.status = unavailable` with `readiness.error_kind = source_unavailable`
+
+If you want the raw engine detail behind the smoke result:
+
+```powershell
+gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --strict-host-key-checking=no --command='curl -fsS http://127.0.0.1:8080/api/state'
+```
+
+`check_realtime_service.sh` now fails if any enabled engine reports `status = error`.
+Use raw `/api/state` when you need:
+- the exact `result.engines[*].reason`
+- the current `readiness.blocking_engine_errors`
+- deeper debugging beyond the pass/fail smoke result
 
 ## 6. Tunnel locally
 
@@ -114,9 +159,36 @@ If the source fails with YouTube bot-check text:
 - export `cookies.txt` and use `YTDLP_COOKIES_FILE`
 - follow [YOUTUBE_COOKIES.md](C:/Users/kirin/OneDrive/Documents/Playground/L4%20Fork/YOUTUBE_COOKIES.md)
 
+If preflight returns `source.status = ready`:
+- do not add cookies just because the source is YouTube
+- the Hogs Breath stream `https://www.youtube.com/watch?v=S605ycm0Vlk` resolved without cookies on 2026-04-23
+
 If the service is up but the frame stays placeholder:
 - inspect `/api/state`
 - trust `readiness`, `source`, `frame`, `metrics`, and `model_status`
+
+If the service is degraded or `full_pipeline_ready = false` while a real frame exists:
+- inspect `readiness.blocking_engine_errors`
+- inspect container logs
+- if you see `Failed to find C compiler`, rebuild the image with `build-essential`
+- if you see `Python.h: No such file or directory`, rebuild the image with `python3-dev`
+- do not treat a live RT-DETR fallback as a full pipeline success
+
+If `/api/state` shows:
+- `model_status.sam3.state = error`
+- `model_status.sam3.error_kind = model_access`
+
+Then:
+- stop debugging the stream or the GPU
+- this is a Hugging Face access problem on `facebook/sam3`
+- rerun with an approved `HF_TOKEN`
+
+If everyone is `unclassified` in `scene_annotations`:
+- inspect `result.engine_outputs.falcon.detections`
+- inspect `result.engine_outputs.rt_detr.candidate_detections`
+- inspect `result.scene_annotations.entities[*].role_reason`
+- if Falcon only returned one full-frame prompt box and RT-DETR found no tables, the classification layer does not have enough usable grounding on that frame
+- that is a prompt/heuristic limitation, not a VM health failure
 
 ## 8. Delete the VM
 

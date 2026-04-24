@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import platform
 import re
 import time
@@ -11,6 +12,48 @@ from PIL import Image
 
 DEFAULT_RT_DETR_MODEL_ID = "PekingU/rtdetr_r18vd"
 DEFAULT_SAM3_MODEL_ID = "facebook/sam3"
+ERROR_KIND_INFERENCE_RUNTIME = "inference_runtime"
+ERROR_KIND_MODEL_ACCESS = "model_access"
+
+
+class ModelAccessError(RuntimeError):
+    """Raised when a model exists but the current HF credentials cannot access it."""
+
+
+def huggingface_token() -> str | None:
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+
+
+def classify_engine_error_kind(message: str | None) -> str | None:
+    if not message:
+        return None
+    lowered = message.lower()
+    model_access_markers = (
+        "model_access",
+        "gated repo",
+        "gated checkpoint",
+        "401 unauthorized",
+        "access to model",
+        "access approval",
+        "restricted",
+        "authenticated to access",
+    )
+    if any(marker in lowered for marker in model_access_markers):
+        return ERROR_KIND_MODEL_ACCESS
+    return ERROR_KIND_INFERENCE_RUNTIME
+
+
+def is_huggingface_access_error(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        class_name = current.__class__.__name__.lower()
+        message = str(current).lower()
+        if "gatedrepoerror" in class_name or classify_engine_error_kind(message) == ERROR_KIND_MODEL_ACCESS:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def normalize_engine_name(name: str) -> str:
@@ -31,7 +74,11 @@ def make_engine_record(
     num_masks: int = 0,
     generation_seconds: float | None = None,
     prompt_boxes_count: int | None = None,
+    error_kind: str | None = None,
 ) -> dict[str, Any]:
+    resolved_error_kind = error_kind
+    if status == "error" and resolved_error_kind is None:
+        resolved_error_kind = classify_engine_error_kind(reason)
     return {
         "name": normalize_engine_name(name),
         "enabled": enabled,
@@ -45,6 +92,7 @@ def make_engine_record(
         "num_masks": num_masks,
         "generation_seconds": generation_seconds,
         "prompt_boxes_count": prompt_boxes_count,
+        "error_kind": resolved_error_kind,
     }
 
 
@@ -423,9 +471,17 @@ def load_sam3_runtime(
         raise RuntimeError("SAM 3 support requires a recent transformers install.") from exc
 
     try:
-        processor = Sam3Processor.from_pretrained(model_id)
-        model = Sam3Model.from_pretrained(model_id)
+        token = huggingface_token()
+        load_kwargs = {} if token is None else {"token": token}
+        processor = Sam3Processor.from_pretrained(model_id, **load_kwargs)
+        model = Sam3Model.from_pretrained(model_id, **load_kwargs)
     except Exception as exc:
+        if is_huggingface_access_error(exc):
+            raise ModelAccessError(
+                f"model_access: SAM 3 checkpoint '{model_id}' is gated or requires Hugging Face "
+                "authentication. Request access to the model and rerun with HF_TOKEN or "
+                "HUGGING_FACE_HUB_TOKEN set."
+            ) from exc
         raise RuntimeError(
             "Could not load SAM 3. The checkpoint may require Hugging Face access approval "
             "or additional authentication."
@@ -489,9 +545,15 @@ def run_sam3_inference(
     detections: list[dict[str, Any]] = []
     bboxes: list[dict[str, float]] = []
     masks_rle: list[dict[str, Any]] = []
-    boxes = results.get("boxes") or []
-    scores = results.get("scores") or []
-    masks = results.get("masks") or []
+    boxes = results.get("boxes")
+    scores = results.get("scores")
+    masks = results.get("masks")
+    if boxes is None:
+        boxes = []
+    if scores is None:
+        scores = []
+    if masks is None:
+        masks = []
 
     for index, (box, score, mask) in enumerate(zip(boxes, scores, masks)):
         if hasattr(box, "tolist"):

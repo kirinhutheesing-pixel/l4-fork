@@ -29,10 +29,15 @@ if health.get("status") != "ok":
 
 readiness = state.get("readiness") or {}
 source = state.get("source") or {}
+blocking_engine_errors = readiness.get("blocking_engine_errors") or []
 summary = {
     "service_state": readiness.get("service_state"),
+    "integration_ready": readiness.get("integration_ready"),
+    "full_pipeline_ready": readiness.get("full_pipeline_ready"),
+    "sam3_visual_ready": readiness.get("sam3_visual_ready"),
     "error_kind": readiness.get("error_kind"),
     "error_message": readiness.get("error_message"),
+    "blocking_engine_errors": blocking_engine_errors,
     "source_status": source.get("status"),
     "source_error_kind": source.get("error_kind"),
     "source_error_message": source.get("error_message"),
@@ -40,7 +45,7 @@ summary = {
 }
 print(json.dumps(summary, indent=2))
 
-if readiness.get("service_state") == "live":
+if readiness.get("full_pipeline_ready") is True:
     raise SystemExit(0)
 
 if source.get("status") in {"auth_required", "unavailable"} and readiness.get("error_kind") in {"source_auth", "source_unavailable"}:
@@ -55,7 +60,7 @@ import json
 import sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     state = json.load(handle)
-raise SystemExit(0 if (state.get("readiness") or {}).get("service_state") == "live" else 1)
+raise SystemExit(0 if (state.get("readiness") or {}).get("full_pipeline_ready") is True else 1)
 PY
   then
     curl -fsS "http://127.0.0.1:${PORT}/api/frame.jpg" -o "${FRAME_PATH}"
