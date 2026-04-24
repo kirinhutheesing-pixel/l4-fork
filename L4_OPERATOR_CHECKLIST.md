@@ -88,9 +88,12 @@ Current required runtime:
 - `task=segmentation`
 - `SAM 3` always loaded
 - `RT-DETR` supplies live prompt boxes
-- `HF_TOKEN` must already have approved access to `facebook/sam3`
+- `HF_TOKEN` must already have approved access to the selected SAM model id
+- default SAM model id is `facebook/sam3`
+- `SAM3_MODEL_ID=facebook/sam3.1` is only a compatibility probe because the official `facebook/sam3.1` Hugging Face repo is checkpoint-only and does not provide Transformers integration
 
 Useful optional launcher env vars:
+- `SAM3_MODEL_ID=facebook/sam3`
 - `FALCON_REFRESH_SECONDS=5.0`
 
 Confirm `/api/state` before judging the screen:

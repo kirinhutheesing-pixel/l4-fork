@@ -11,6 +11,7 @@ HF_CACHE_DIR="${HF_CACHE_DIR:-/opt/falcon-pipeline/hf-cache}"
 OUTPUT_DIR="${OUTPUT_DIR:-/opt/falcon-pipeline/outputs}"
 COOKIE_TARGET="/run/secrets/youtube-cookies.txt"
 TASK="segmentation"
+SAM3_MODEL_ID="${SAM3_MODEL_ID:-facebook/sam3}"
 MIN_DIM="${MIN_DIM:-480}"
 MAX_DIM="${MAX_DIM:-960}"
 FALCON_MIN_DIM="${FALCON_MIN_DIM:-256}"
@@ -67,6 +68,7 @@ service_runtime_args=(
   --falcon-max-dim "${FALCON_MAX_DIM}"
   --falcon-max-new-tokens "${FALCON_MAX_NEW_TOKENS}"
   --falcon-refresh-seconds "${FALCON_REFRESH_SECONDS}"
+  --sam3-model-id "${SAM3_MODEL_ID}"
 )
 
 preflight_cmd=(

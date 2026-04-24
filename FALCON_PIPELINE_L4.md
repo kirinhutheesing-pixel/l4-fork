@@ -22,6 +22,7 @@ The intended default runtime is:
 - Task: `segmentation`
 - RT-DETR: enabled
 - SAM 3: enabled and required
+- SAM model id: `facebook/sam3` by default
 - `max_dim=960`
 - `falcon_refresh_seconds=5.0`
 
@@ -33,6 +34,8 @@ The supported bring-up is now the SAM 3 segmentation view:
 - SAM 3 is always loaded by the service and is not an operator toggle
 - when SAM 3 returns masks, `primary_engine` becomes `sam3` and `/api/frame.jpg` shows the SAM 3 mask overlay
 - while SAM 3 is loading or segmenting, the service can still show RT-DETR/Falcon-backed frames, but `/api/state` keeps `full_pipeline_ready=false` until SAM 3 is healthy and visibly primary
+
+SAM 3.1 note: `facebook/sam3.1` is a gated checkpoint repo, but the official Hugging Face model card says it has no Transformers integration. The current service uses the Transformers `Sam3Model` / `Sam3Processor` path, so `facebook/sam3` remains the default. Use `SAM3_MODEL_ID=facebook/sam3.1` only as an explicit compatibility probe until the service has a native `facebookresearch/sam3` package integration.
 
 Use `/api/state` to confirm the active visual path:
 - `result.primary_engine = "sam3"` means the visible overlay is currently SAM 3-driven
@@ -211,6 +214,8 @@ Example environment:
 export TEST_SOURCE_URL="https://www.youtube.com/@earthcam/live"
 export TEST_PROMPT="people near the center of the frame"
 export HF_TOKEN="hf_..."
+# Optional compatibility probe only:
+# export SAM3_MODEL_ID="facebook/sam3.1"
 ```
 
 If that channel is not live when you test, replace it with any current public YouTube live URL.
@@ -232,8 +237,10 @@ What `run_realtime_service.sh` does:
 - launches the long-running container only after preflight succeeds
 - defaults to `--no-compile`
 - mounts the cookie file only when `YTDLP_COOKIES_FILE` is set
+- accepts `SAM3_MODEL_ID` for explicit checkpoint compatibility probes
 
 Optional runtime environment toggles:
+- `SAM3_MODEL_ID`: defaults to `facebook/sam3`
 - `FALCON_REFRESH_SECONDS`: defaults to `5.0`
 - `FALCON_MIN_DIM`, `FALCON_MAX_DIM`, `FALCON_MAX_NEW_TOKENS`
 - `MIN_DIM`, `MAX_DIM`
@@ -242,7 +249,7 @@ Important:
 - YouTube cookies and Hugging Face model access are separate concerns
 - `cookies.txt` only fixes bot-gated YouTube ingest
 - it does not fix a gated SAM 3 checkpoint
-- always provide an `HF_TOKEN` that has approved access to `facebook/sam3`
+- always provide an `HF_TOKEN` that has approved access to the selected SAM model id
 
 If a YouTube stream is bot-gated, export a Netscape-format `cookies.txt` from a signed-in browser and mount it into the container:
 
