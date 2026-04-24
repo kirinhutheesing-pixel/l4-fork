@@ -34,8 +34,12 @@ from falcon_perception import (  # noqa: E402
 from perception_orchestrator import (  # noqa: E402
     DEFAULT_RT_DETR_MODEL_ID,
     DEFAULT_SAM3_MODEL_ID,
+    ModelAccessError,
+    ModelUnsupportedError,
     build_orchestrated_inference,
     classify_engine_error_kind,
+    huggingface_token,
+    inspect_torch_stack,
     intersection_over_union,
     load_rtdetr_runtime,
     load_sam3_runtime,
@@ -98,7 +102,14 @@ ERROR_KIND_SOURCE_AUTH = "source_auth"
 ERROR_KIND_SOURCE_UNAVAILABLE = "source_unavailable"
 ERROR_KIND_MODEL_LOAD = "model_load"
 ERROR_KIND_MODEL_ACCESS = "model_access"
+ERROR_KIND_MODEL_UNSUPPORTED = "model_unsupported"
 ERROR_KIND_INFERENCE_RUNTIME = "inference_runtime"
+
+SAM_PREFLIGHT_STATUS_READY = "ready"
+SAM_PREFLIGHT_STATUS_MISSING_TOKEN = "missing_token"
+SAM_PREFLIGHT_STATUS_ACCESS_REQUIRED = "access_required"
+SAM_PREFLIGHT_STATUS_UNSUPPORTED = "unsupported"
+SAM_PREFLIGHT_STATUS_LOAD_FAILED = "load_failed"
 
 
 def resize_image_to_bounds(image: Image.Image, *, min_dim: int, max_dim: int) -> Image.Image:
@@ -231,8 +242,9 @@ def classify_source_error(message: str) -> tuple[str, str]:
 
 
 def classify_model_load_error_kind(message: str | None) -> str:
-    if classify_engine_error_kind(message) == ERROR_KIND_MODEL_ACCESS:
-        return ERROR_KIND_MODEL_ACCESS
+    engine_error_kind = classify_engine_error_kind(message)
+    if engine_error_kind in {ERROR_KIND_MODEL_ACCESS, ERROR_KIND_MODEL_UNSUPPORTED}:
+        return engine_error_kind
     return ERROR_KIND_MODEL_LOAD
 
 
@@ -1661,6 +1673,99 @@ def run_source_preflight(
     }, exit_code
 
 
+def run_sam_preflight(*, model_id: str) -> tuple[dict[str, Any], int]:
+    torch_stack = inspect_torch_stack()
+    token_configured = bool(huggingface_token())
+    base_payload: dict[str, Any] = {
+        "ok": False,
+        "exit_code": 25,
+        "model_id": model_id,
+        "status": SAM_PREFLIGHT_STATUS_LOAD_FAILED,
+        "error_kind": ERROR_KIND_MODEL_LOAD,
+        "error_message": None,
+        "token_configured": token_configured,
+        "cuda_available": bool(torch_stack.get("cuda_available")),
+        "transformers_sam3_available": bool(
+            torch_stack.get("transformers_available") and torch_stack.get("has_sam3")
+        ),
+    }
+
+    if not token_configured:
+        payload = {
+            **base_payload,
+            "exit_code": 22,
+            "status": SAM_PREFLIGHT_STATUS_MISSING_TOKEN,
+            "error_kind": ERROR_KIND_MODEL_ACCESS,
+            "error_message": "SAM 3 is mandatory; set HF_TOKEN or HUGGING_FACE_HUB_TOKEN.",
+        }
+        return payload, 22
+
+    if not base_payload["transformers_sam3_available"]:
+        payload = {
+            **base_payload,
+            "exit_code": 24,
+            "status": SAM_PREFLIGHT_STATUS_UNSUPPORTED,
+            "error_kind": ERROR_KIND_MODEL_UNSUPPORTED,
+            "error_message": "This image does not expose Transformers Sam3Model/Sam3Processor support.",
+        }
+        return payload, 24
+
+    try:
+        runtime = load_sam3_runtime(model_id, allow_experimental_non_cuda=False)
+    except ModelAccessError as exc:
+        payload = {
+            **base_payload,
+            "exit_code": 23,
+            "status": SAM_PREFLIGHT_STATUS_ACCESS_REQUIRED,
+            "error_kind": ERROR_KIND_MODEL_ACCESS,
+            "error_message": str(exc),
+        }
+        return payload, 23
+    except ModelUnsupportedError as exc:
+        payload = {
+            **base_payload,
+            "exit_code": 24,
+            "status": SAM_PREFLIGHT_STATUS_UNSUPPORTED,
+            "error_kind": ERROR_KIND_MODEL_UNSUPPORTED,
+            "error_message": str(exc),
+        }
+        return payload, 24
+    except Exception as exc:
+        error_kind = classify_model_load_error_kind(str(exc))
+        if error_kind == ERROR_KIND_MODEL_ACCESS:
+            exit_code = 23
+            status = SAM_PREFLIGHT_STATUS_ACCESS_REQUIRED
+        elif error_kind == ERROR_KIND_MODEL_UNSUPPORTED:
+            exit_code = 24
+            status = SAM_PREFLIGHT_STATUS_UNSUPPORTED
+        else:
+            exit_code = 25
+            status = SAM_PREFLIGHT_STATUS_LOAD_FAILED
+            error_kind = ERROR_KIND_MODEL_LOAD
+        payload = {
+            **base_payload,
+            "exit_code": exit_code,
+            "status": status,
+            "error_kind": error_kind,
+            "error_message": str(exc),
+        }
+        return payload, exit_code
+
+    payload = {
+        **base_payload,
+        "ok": True,
+        "exit_code": 0,
+        "status": SAM_PREFLIGHT_STATUS_READY,
+        "error_kind": None,
+        "error_message": None,
+        "cuda_available": True,
+        "transformers_sam3_available": True,
+    }
+    if isinstance(runtime, dict) and runtime.get("device"):
+        payload["device"] = runtime.get("device")
+    return payload, 0
+
+
 def create_app(service: FalconPipelineRealtimeService, ui_html: str):
     app = FastAPI(title="Falcon Pipeline Realtime")
 
@@ -1743,6 +1848,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Resolve and probe the source, emit JSON to stdout, then exit without loading models.",
     )
+    parser.add_argument(
+        "--sam-preflight-only",
+        action="store_true",
+        help="Probe the configured SAM 3 checkpoint, emit JSON to stdout, then exit without launching the service.",
+    )
     parser.add_argument("--ui-path", type=Path, default=DEFAULT_UI_PATH, help="HTML UI file to serve.")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile for Falcon.")
     parser.add_argument("--no-load-rtdetr", action="store_true", help="Skip loading RT-DETR at startup.")
@@ -1760,6 +1870,11 @@ def main() -> int:
     args = parse_args()
 
     resolved_cookie_file = (None if args.yt_cookies_file is None else args.yt_cookies_file.expanduser().resolve())
+    if args.sam_preflight_only:
+        payload, exit_code = run_sam_preflight(model_id=args.sam3_model_id)
+        print(json.dumps(payload, indent=2))
+        return exit_code
+
     if args.preflight_only:
         payload, exit_code = run_source_preflight(
             source_url=args.source_url,

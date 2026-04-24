@@ -619,3 +619,36 @@ Hardening needed next:
 - update tunnel docs to prefer IAP plus `--ssh-flag` syntax on this Windows machine
 - add a state test for the exact flapping sequence observed live: ready SAM result, worker enters `segmenting`, readiness remains live
 - add a smoke assertion that `result.primary_engine = "sam3"` and `result.engines[name=sam3].num_masks > 0`, not only `full_pipeline_ready = true`
+
+## Current local hardening after the approved SAM 3 run
+
+Implemented process hardening:
+- `scripts/gcp/build_l4_image.ps1` is now the preferred build command
+- the build wrapper clones or fast-forwards `/home/kirin/l4-fork`, starts `docker build` with `nohup`, writes `/tmp/falcon-pipeline-build.log`, and polls until `falcon-pipeline:l4` exists or the build fails
+- the wrapper defaults to `--tunnel-through-iap`, matching the working transport on this Windows workstation
+- `scripts/gcp/run_realtime_service.sh` now runs source preflight first, SAM model preflight second, then launches the long-running container only if both pass
+
+Implemented SAM 3 model diagnostics:
+- `--sam-preflight-only` emits structured JSON before service launch
+- exit `22` means no Hugging Face token was configured
+- exit `23` means gated/model access failure
+- exit `24` means unsupported checkpoint/runtime mismatch
+- exit `25` means generic model-load/runtime failure
+- `model_unsupported` is now distinct from `model_access` and `model_load`
+- `facebook/sam3` remains the supported runtime model id
+- `facebook/sam3.1` remains an explicit compatibility probe only
+
+Implemented smoke hardening:
+- `check_realtime_service.sh` still accepts structured `source_auth` and `source_unavailable` as useful diagnostic exits
+- a successful full run now requires `full_pipeline_ready = true`
+- a successful full run also requires `readiness.sam3_visual_ready = true`
+- a successful full run requires `result.primary_engine = "sam3"`
+- a successful full run requires SAM3 engine `status = "ok"` and `num_masks > 0`
+- `segmenting` is accepted only when there is a recent prior SAM3 primary overlay
+- optional `CHECK_RESTAURANT_CONTRACT=1` verifies restaurant person entities include `role_reason`, `role_confidence`, `classification_source`, and `near_guest_context`
+
+Next VM acceptance should prove:
+- default `SAM3_MODEL_ID=facebook/sam3` reaches `full_pipeline_ready = true`
+- readiness does not flap while SAM3 alternates between `ready` and `segmenting`
+- `check_realtime_service.sh` passes without weakening the SAM3 visible-primary checks
+- `SAM3_MODEL_ID=facebook/sam3.1` fails cleanly as `model_unsupported` or `model_access`, not a generic SAM error

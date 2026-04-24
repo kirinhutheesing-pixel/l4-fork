@@ -61,34 +61,32 @@ If the winning zone is not the same as `$env:ZONE`, update `$env:ZONE` before th
 ## 3. Build the image
 
 ```powershell
-gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --strict-host-key-checking=no --command='cd /home/kirin && if [ ! -d l4-fork ]; then git clone https://github.com/kirinhutheesing-pixel/l4-fork.git; fi && cd /home/kirin/l4-fork && git pull --ff-only && sudo docker build -f Dockerfile.gcp-l4 -t falcon-pipeline:l4 .'
+pwsh -File .\scripts\gcp\build_l4_image.ps1 -ProjectId $env:PROJECT_ID -Zone $env:ZONE -VmName $env:VM_NAME
 ```
 
-If IAP/Plink drops during layer export, do not restart blindly. First check:
-
-```powershell
-gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --tunnel-through-iap --strict-host-key-checking=no --command='sudo docker images --format "{{.Repository}}:{{.Tag}} {{.ID}} {{.Size}}" | grep falcon-pipeline || true'
-```
-
-If no `falcon-pipeline:l4` image exists, rerun the build as a detached VM-side job and poll `/tmp/falcon-pipeline-build.log`.
+This wrapper clones or pulls `/home/kirin/l4-fork`, starts the Docker build as a detached VM-side job, polls `/tmp/falcon-pipeline-build.log`, and uses IAP by default. Use it instead of a foreground SSH build because foreground IAP/Plink sessions have dropped during Docker layer export.
 
 ## 4. Start the service
 
 ```powershell
-gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --strict-host-key-checking=no --command='cd /home/kirin/l4-fork && TEST_SOURCE_URL="YOUR_STREAM_URL" TEST_PROMPT="YOUR_PROMPT" HF_TOKEN="YOUR_APPROVED_HF_TOKEN" bash scripts/gcp/run_realtime_service.sh'
+gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --tunnel-through-iap --strict-host-key-checking=no --command='cd /home/kirin/l4-fork && TEST_SOURCE_URL="YOUR_STREAM_URL" TEST_PROMPT="YOUR_PROMPT" HF_TOKEN="YOUR_APPROVED_HF_TOKEN" bash scripts/gcp/run_realtime_service.sh'
 ```
 
 Cookie-backed YouTube form:
 
 ```powershell
-gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --strict-host-key-checking=no --command='cd /home/kirin/l4-fork && TEST_SOURCE_URL="YOUR_STREAM_URL" TEST_PROMPT="YOUR_PROMPT" HF_TOKEN="YOUR_APPROVED_HF_TOKEN" YTDLP_COOKIES_FILE="/opt/falcon-pipeline/youtube-cookies.txt" bash scripts/gcp/run_realtime_service.sh'
+gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --tunnel-through-iap --strict-host-key-checking=no --command='cd /home/kirin/l4-fork && TEST_SOURCE_URL="YOUR_STREAM_URL" TEST_PROMPT="YOUR_PROMPT" HF_TOKEN="YOUR_APPROVED_HF_TOKEN" YTDLP_COOKIES_FILE="/opt/falcon-pipeline/youtube-cookies.txt" bash scripts/gcp/run_realtime_service.sh'
 ```
 
 `run_realtime_service.sh` always:
 - runs a source preflight first
+- runs a SAM 3 model preflight second
 - exits `20` on source auth failures
 - exits `21` on unavailable/unplayable sources
 - exits `22` if `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` is missing
+- exits `23` on gated SAM model access
+- exits `24` on unsupported SAM checkpoint/runtime mismatch
+- exits `25` on generic SAM model load failure
 - launches the container with `--no-compile`
 - mounts the cookie file only when `YTDLP_COOKIES_FILE` is set
 
@@ -114,7 +112,7 @@ Confirm `/api/state` before judging the screen:
 ## 5. Verify runtime
 
 ```powershell
-gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --strict-host-key-checking=no --command='cd /home/kirin/l4-fork && bash scripts/gcp/check_realtime_service.sh'
+gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --tunnel-through-iap --strict-host-key-checking=no --command='cd /home/kirin/l4-fork && bash scripts/gcp/check_realtime_service.sh'
 ```
 
 Healthy live target:
@@ -123,6 +121,9 @@ Healthy live target:
 - `readiness.full_pipeline_ready = true`
 - `readiness.sam3_visual_ready = true`
 - `readiness.blocking_engine_errors = []`
+- `result.primary_engine = sam3`
+- SAM3 engine `status = ok`
+- SAM3 `num_masks > 0`
 - `source.status = ready`
 - `frame.ready = true`
 
@@ -133,10 +134,10 @@ Structured blocked target:
 If you want the raw engine detail behind the smoke result:
 
 ```powershell
-gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --strict-host-key-checking=no --command='curl -fsS http://127.0.0.1:8080/api/state'
+gcloud compute ssh $env:VM_NAME --project=$env:PROJECT_ID --zone=$env:ZONE --tunnel-through-iap --strict-host-key-checking=no --command='curl -fsS http://127.0.0.1:8080/api/state'
 ```
 
-`check_realtime_service.sh` now fails if any enabled engine reports `status = error`.
+`check_realtime_service.sh` now fails if any enabled engine reports `status = error`, if SAM3 is not the visible primary output, or if SAM3 reports zero masks.
 Use raw `/api/state` when you need:
 - the exact `result.engines[*].reason`
 - the current `readiness.blocking_engine_errors`
@@ -195,6 +196,15 @@ Then:
 - this is a Hugging Face access or unsupported-checkpoint problem on the selected SAM model id
 - rerun with an approved `HF_TOKEN`
 - use `facebook/sam3` for supported runs; `facebook/sam3.1` still needs a separate integration proof
+
+If `/api/state` shows:
+- `model_status.sam3.state = error`
+- `model_status.sam3.error_kind = model_unsupported`
+
+Then:
+- stop retrying the same checkpoint
+- use `SAM3_MODEL_ID=facebook/sam3`
+- treat `facebook/sam3.1` as unsupported until a native loader path is added and proven
 
 If everyone is `unclassified` in `scene_annotations`:
 - inspect `result.engine_outputs.falcon.detections`

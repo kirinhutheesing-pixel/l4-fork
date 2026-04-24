@@ -92,6 +92,26 @@ if [[ ${preflight_exit} -ne 0 ]]; then
   exit "${preflight_exit}"
 fi
 
+sam_preflight_cmd=(
+  sudo docker run --rm
+  --gpus all
+  "${common_args[@]}"
+  "${service_entrypoint[@]}"
+  --sam3-model-id "${SAM3_MODEL_ID}"
+  --sam-preflight-only
+)
+
+set +e
+sam_preflight_output="$("${sam_preflight_cmd[@]}" 2>&1)"
+sam_preflight_exit=$?
+set -e
+
+echo "${sam_preflight_output}"
+
+if [[ ${sam_preflight_exit} -ne 0 ]]; then
+  exit "${sam_preflight_exit}"
+fi
+
 sudo docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
 
 launch_cmd=(

@@ -7,7 +7,7 @@ from unittest import mock
 import numpy as np
 from PIL import Image
 
-from perception_orchestrator import ModelAccessError, load_sam3_runtime, run_sam3_inference
+from perception_orchestrator import ModelAccessError, ModelUnsupportedError, load_sam3_runtime, run_sam3_inference
 
 
 class FakeSam3Model:
@@ -42,6 +42,12 @@ class FailingSam3Processor:
     @classmethod
     def from_pretrained(cls, _model_id: str, **_kwargs):
         raise GatedRepoError("401 Unauthorized. Access to model facebook/sam3 is restricted.")
+
+
+class UnsupportedSam3Processor:
+    @classmethod
+    def from_pretrained(cls, _model_id: str, **_kwargs):
+        raise RuntimeError("Unrecognized model in checkpoint facebook/sam3.1.")
 
 
 class AmbiguousSequence(list):
@@ -118,6 +124,22 @@ class Sam3RuntimeTests(unittest.TestCase):
         self.assertIn("model_access", message)
         self.assertIn("facebook/sam3", message)
         self.assertIn("HF_TOKEN", message)
+
+    def test_load_sam3_runtime_surfaces_unsupported_checkpoint(self) -> None:
+        transformers = types.SimpleNamespace(
+            Sam3Model=FakeSam3Model,
+            Sam3Processor=UnsupportedSam3Processor,
+        )
+        with (
+            mock.patch.dict(sys.modules, {"transformers": transformers}),
+            mock.patch("perception_orchestrator._torch_device", return_value=(object(), "cuda")),
+        ):
+            with self.assertRaises(ModelUnsupportedError) as caught:
+                load_sam3_runtime("facebook/sam3.1")
+
+        message = str(caught.exception)
+        self.assertIn("model_unsupported", message)
+        self.assertIn("facebook/sam3.1", message)
 
     def test_load_sam3_runtime_keeps_non_cuda_guard(self) -> None:
         with mock.patch("perception_orchestrator._torch_device", return_value=(object(), "cpu")):

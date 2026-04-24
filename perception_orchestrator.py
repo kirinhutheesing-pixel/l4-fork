@@ -14,10 +14,15 @@ DEFAULT_RT_DETR_MODEL_ID = "PekingU/rtdetr_r18vd"
 DEFAULT_SAM3_MODEL_ID = "facebook/sam3"
 ERROR_KIND_INFERENCE_RUNTIME = "inference_runtime"
 ERROR_KIND_MODEL_ACCESS = "model_access"
+ERROR_KIND_MODEL_UNSUPPORTED = "model_unsupported"
 
 
 class ModelAccessError(RuntimeError):
     """Raised when a model exists but the current HF credentials cannot access it."""
+
+
+class ModelUnsupportedError(RuntimeError):
+    """Raised when the checkpoint is reachable but unsupported by this runtime path."""
 
 
 def huggingface_token() -> str | None:
@@ -40,6 +45,19 @@ def classify_engine_error_kind(message: str | None) -> str | None:
     )
     if any(marker in lowered for marker in model_access_markers):
         return ERROR_KIND_MODEL_ACCESS
+    model_unsupported_markers = (
+        "model_unsupported",
+        "unrecognized configuration class",
+        "unrecognized model",
+        "not supported for",
+        "unsupported checkpoint",
+        "unsupported model",
+        "unsupported architecture",
+        "disabled on non-cuda",
+        "sam 3 support requires a recent transformers",
+    )
+    if any(marker in lowered for marker in model_unsupported_markers):
+        return ERROR_KIND_MODEL_UNSUPPORTED
     return ERROR_KIND_INFERENCE_RUNTIME
 
 
@@ -51,6 +69,18 @@ def is_huggingface_access_error(exc: BaseException) -> bool:
         class_name = current.__class__.__name__.lower()
         message = str(current).lower()
         if "gatedrepoerror" in class_name or classify_engine_error_kind(message) == ERROR_KIND_MODEL_ACCESS:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def is_model_unsupported_error(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if classify_engine_error_kind(message) == ERROR_KIND_MODEL_UNSUPPORTED:
             return True
         current = current.__cause__ or current.__context__
     return False
@@ -468,7 +498,7 @@ def load_sam3_runtime(
     try:
         from transformers import Sam3Model, Sam3Processor
     except Exception as exc:  # pragma: no cover - dependency surfaced in UI.
-        raise RuntimeError("SAM 3 support requires a recent transformers install.") from exc
+        raise ModelUnsupportedError("model_unsupported: SAM 3 support requires a recent transformers install.") from exc
 
     try:
         token = huggingface_token()
@@ -482,9 +512,13 @@ def load_sam3_runtime(
                 "authentication. Request access to the model and rerun with HF_TOKEN or "
                 "HUGGING_FACE_HUB_TOKEN set."
             ) from exc
+        if is_model_unsupported_error(exc):
+            raise ModelUnsupportedError(
+                f"model_unsupported: SAM 3 checkpoint '{model_id}' is reachable but unsupported by "
+                "the current Transformers Sam3Model/Sam3Processor runtime."
+            ) from exc
         raise RuntimeError(
-            "Could not load SAM 3. The checkpoint may require Hugging Face access approval "
-            "or additional authentication."
+            f"model_load: Could not load SAM 3 checkpoint '{model_id}' with the current runtime."
         ) from exc
 
     model.to(device)

@@ -76,10 +76,11 @@ If the preferred zone is exhausted again, retry another L4-capable zone before c
 - `Dockerfile.gcp-l4`: container image for the L4 VM
 - `requirements-gcp-l4.txt`: Docker and VM Python dependencies
 - `scripts/gcp/create_l4_vm.ps1`: zone-retrying VM create + bootstrap/GPU validation
+- `scripts/gcp/build_l4_image.ps1`: detached VM-side Docker build + log polling
 - `scripts/gcp/delete_l4_vm.ps1`: verified teardown for instance + same-name boot disk
 - `scripts/gcp/status_l4_vm.ps1`: read-only VM, GPU, container, API, and log summary
-- `scripts/gcp/run_realtime_service.sh`: source preflight + container launch
-- `scripts/gcp/check_realtime_service.sh`: host/Docker/API smoke check
+- `scripts/gcp/run_realtime_service.sh`: source preflight + SAM 3 preflight + container launch
+- `scripts/gcp/check_realtime_service.sh`: host/Docker/API/SAM-primary smoke check
 
 ## Agent quick start
 
@@ -194,10 +195,26 @@ If `nvidia-smi` is still missing, reboot once and rerun the checks. The Google G
 
 ## 4. Clone the repo and build the image
 
+Preferred Windows-side wrapper:
+
+```powershell
+pwsh -File .\scripts\gcp\build_l4_image.ps1 -ProjectId $env:PROJECT_ID -Zone $env:ZONE -VmName $env:VM_NAME
+```
+
+What the wrapper does:
+- clones or fast-forwards `/home/kirin/l4-fork` on the VM
+- starts `sudo docker build -f Dockerfile.gcp-l4 -t falcon-pipeline:l4 .` as a detached VM-side job
+- writes logs to `/tmp/falcon-pipeline-build.log`
+- polls until `falcon-pipeline:l4` exists or the build fails
+- uses `--tunnel-through-iap` by default to avoid direct SSH flakiness on this workstation
+
+Manual VM-side equivalent:
+
 ```bash
 git clone https://github.com/kirinhutheesing-pixel/l4-fork.git
 cd l4-fork
-docker build -f Dockerfile.gcp-l4 -t falcon-pipeline:l4 .
+nohup sudo docker build -f Dockerfile.gcp-l4 -t falcon-pipeline:l4 . > /tmp/falcon-pipeline-build.log 2>&1 < /dev/null &
+tail -f /tmp/falcon-pipeline-build.log
 ```
 
 Notes:
@@ -206,8 +223,7 @@ Notes:
 - neither weights nor outputs are baked into the image
 - the image must include `build-essential` and `python3-dev` for Falcon/Triton helper compilation
 - if Falcon logs mention `Failed to find C compiler` or `Python.h: No such file or directory`, rebuild from the current repo before debugging anything else
-- on Windows/IAP, foreground SSH can drop during Docker layer export; if that happens, check `sudo docker images` before rebuilding
-- if the image is absent after an SSH drop, rerun the build as a detached VM-side job and poll `/tmp/falcon-pipeline-build.log`
+- on Windows/IAP, foreground SSH can drop during Docker layer export; use `build_l4_image.ps1` instead of hand-running a foreground build
 
 ## 5. Launch the service
 
@@ -238,7 +254,11 @@ What `run_realtime_service.sh` does:
 - runs the service image in `--preflight-only` mode first
 - exits `20` on source auth failures
 - exits `21` on unavailable/unplayable sources
+- runs the service image in `--sam-preflight-only` mode second
 - exits `22` when no Hugging Face token is present, because SAM 3 is mandatory
+- exits `23` when the SAM checkpoint is gated or the token lacks approved access
+- exits `24` when the SAM checkpoint/runtime combination is unsupported, including current `facebook/sam3.1` Transformers mismatch cases
+- exits `25` on generic SAM model-load/runtime failures
 - launches the long-running container only after preflight succeeds
 - defaults to `--no-compile`
 - mounts the cookie file only when `YTDLP_COOKIES_FILE` is set
@@ -363,13 +383,16 @@ Expected progression:
    - `readiness.service_state = "live"`
    - `readiness.integration_ready = true`
    - `readiness.full_pipeline_ready = true`
+   - `readiness.sam3_visual_ready = true`
    - `readiness.blocking_engine_errors = []`
    - `source.status = "ready"`
    - `frame.state = "live"`
    - `frame.is_placeholder = false`
    - `frame.ready = true`
    - `rtdetr_available = true`
-   - `sam3_available = false`
+   - `sam3_available = true`
+   - `result.primary_engine = "sam3"`
+   - `result.num_masks > 0`
 
 3a. Degraded live frame:
    - `readiness.service_state = "degraded"`
@@ -378,10 +401,13 @@ Expected progression:
    - `readiness.blocking_engine_errors` is non-empty
    - this means the service is producing a real frame, but at least one enabled engine is still failing
 
-3b. Full Falcon proof:
+3b. Full SAM 3 proof:
    - `readiness.full_pipeline_ready = true`
+   - `readiness.sam3_visual_ready = true`
+   - `result.primary_engine = "sam3"`
    - `result.engines[]` contains `falcon` with `status != "error"`
-   - `result.engines[]` contains `rt-detr` with `status = "ok"`
+   - `result.engines[]` contains `rt_detr` with `status = "ok"`
+   - `result.engines[]` contains `sam3` with `status = "ok"` and `num_masks > 0`
    - `readiness.blocking_engine_errors = []`
    - `metrics.last_error = null`
 
@@ -389,6 +415,7 @@ Important:
 - `readiness.service_state = "live"` plus `frame.ready = true` only proves the service is producing a real frame
 - it does not prove Falcon guidance is healthy, because RT-DETR can keep the service live on its own
 - use `readiness.full_pipeline_ready` as the first pass/fail gate
+- use `readiness.sam3_visual_ready`, `result.primary_engine`, and SAM 3 mask count as the visual proof gate
 - use `result.engines[*].status` and `result.engines[*].reason` as the final proof surface for engine-specific diagnosis
 
 4. Explicit source block:
@@ -470,6 +497,7 @@ If `/api/healthz` works but `/api/state` stays in `warming`:
 - inspect container logs for Hugging Face download or model-load errors
 - if you skipped `HF_TOKEN`, retry with it set
 - if `model_status.sam3.error_kind = "model_access"`, this is a gated Hugging Face checkpoint, not a stream problem
+- if `model_status.sam3.error_kind = "model_unsupported"`, this checkpoint is not usable through the current Transformers SAM 3 path; use `facebook/sam3`
 
 If `/api/state` says `service_state = "degraded"` or `full_pipeline_ready = false` while a real frame exists:
 - inspect `readiness.blocking_engine_errors`
@@ -477,6 +505,7 @@ If `/api/state` says `service_state = "degraded"` or `full_pipeline_ready = fals
 - treat `result.engines[].status = "error"` for `falcon` as a real pipeline failure
 - treat `result.engines[].status = "error"` for `sam3` as a real segmentation failure because SAM 3 is mandatory
 - if `result.primary_engine = "sam3"` but `sam3_segmentation_state = "segmenting"`, make sure the VM has commit `60590b1` or newer; older builds flapped readiness while computing the next mask
+- run `bash scripts/gcp/check_realtime_service.sh` to enforce `primary_engine=sam3`, SAM3 engine `status=ok`, and `num_masks > 0`
 
 If `/api/state` shows `capture_state = "error"`:
 - the source URL is not currently usable

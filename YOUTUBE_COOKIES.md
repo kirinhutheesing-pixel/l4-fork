@@ -20,6 +20,7 @@ Use cookies only if preflight or `/api/state` reports:
 Do not confuse this with gated model access:
 - YouTube cookies do not help if `SAM 3` fails to load from Hugging Face
 - that case requires an `HF_TOKEN` with approved access to `facebook/sam3`
+- cookies also do not fix `model_unsupported`; if `SAM3_MODEL_ID=facebook/sam3.1` fails the SAM preflight, switch back to `facebook/sam3`
 
 ## 1. Export the cookie file locally
 
@@ -70,3 +71,17 @@ The service should expose one of these clean outcomes in `/api/state`:
   - `readiness.error_kind = "source_auth"`
 
 If it still reports `source_auth`, the cookie export is not usable for that stream and should be refreshed.
+
+## 5. Keep source auth separate from SAM auth
+
+`run_realtime_service.sh` now proves two separate things before launch:
+- source preflight checks YouTube/direct ingest and can return `source_auth` or `source_unavailable`
+- SAM preflight checks Hugging Face model access and runtime compatibility
+
+If source preflight is `ready` but SAM preflight exits:
+- `22`: set `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN`
+- `23`: the token lacks approved access to the selected SAM checkpoint
+- `24`: the selected checkpoint is unsupported by the current Transformers SAM 3 path
+- `25`: generic SAM model-load/runtime failure
+
+Do not refresh YouTube cookies for SAM preflight failures.

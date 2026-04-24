@@ -15,12 +15,20 @@ from falcon_pipeline_realtime_service import (
     ERROR_KIND_INFERENCE_RUNTIME,
     ERROR_KIND_MODEL_ACCESS,
     ERROR_KIND_MODEL_LOAD,
+    ERROR_KIND_MODEL_UNSUPPORTED,
     ERROR_KIND_SOURCE_AUTH,
     ERROR_KIND_SOURCE_UNAVAILABLE,
     FalconGuidance,
     FalconPipelineRealtimeService,
     LiveSessionConfig,
+    ModelAccessError,
+    ModelUnsupportedError,
     RuntimeOptions,
+    SAM_PREFLIGHT_STATUS_ACCESS_REQUIRED,
+    SAM_PREFLIGHT_STATUS_LOAD_FAILED,
+    SAM_PREFLIGHT_STATUS_MISSING_TOKEN,
+    SAM_PREFLIGHT_STATUS_READY,
+    SAM_PREFLIGHT_STATUS_UNSUPPORTED,
     Sam3Guidance,
     SOURCE_STATUS_AUTH_REQUIRED,
     SOURCE_STATUS_IDLE,
@@ -29,6 +37,7 @@ from falcon_pipeline_realtime_service import (
     build_restaurant_scene_annotations,
     create_app,
     parse_args,
+    run_sam_preflight,
     run_source_preflight,
 )
 
@@ -80,6 +89,7 @@ class RealtimeServiceTests(unittest.TestCase):
         self.assertEqual(args.task, "segmentation")
         self.assertTrue(args.enable_sam3)
         self.assertTrue(args.load_sam3)
+        self.assertFalse(args.sam_preflight_only)
         self.assertFalse(args.no_load_rtdetr)
         self.assertEqual(args.max_dim, 960)
         self.assertEqual(args.falcon_refresh_seconds, 5.0)
@@ -329,6 +339,135 @@ class RealtimeServiceTests(unittest.TestCase):
         self.assertEqual(state["model_status"]["sam3"]["state"], "error")
         self.assertEqual(state["model_status"]["sam3"]["error_kind"], ERROR_KIND_MODEL_ACCESS)
         self.assertEqual(state["readiness"]["error_kind"], ERROR_KIND_MODEL_ACCESS)
+
+    def test_sam3_model_unsupported_error_is_operator_visible(self) -> None:
+        service = self.make_service(source_url="", load_rtdetr=True, load_sam3=True)
+
+        with (
+            mock.patch("falcon_pipeline_realtime_service.FalconRealtimeRuntime", return_value=object()),
+            mock.patch("falcon_pipeline_realtime_service.load_rtdetr_runtime", return_value={"model": object()}),
+            mock.patch(
+                "falcon_pipeline_realtime_service.load_sam3_runtime",
+                side_effect=RuntimeError("model_unsupported: facebook/sam3.1 is not supported"),
+            ),
+        ):
+            service._load_models()
+
+        state = service.get_state()
+        self.assertEqual(state["model_status"]["sam3"]["state"], "error")
+        self.assertEqual(state["model_status"]["sam3"]["error_kind"], ERROR_KIND_MODEL_UNSUPPORTED)
+        self.assertEqual(state["readiness"]["error_kind"], ERROR_KIND_MODEL_UNSUPPORTED)
+        self.assertFalse(state["readiness"]["full_pipeline_ready"])
+
+    def test_sam_preflight_missing_token_returns_22(self) -> None:
+        with (
+            mock.patch("falcon_pipeline_realtime_service.huggingface_token", return_value=None),
+            mock.patch(
+                "falcon_pipeline_realtime_service.inspect_torch_stack",
+                return_value={"cuda_available": True, "transformers_available": True, "has_sam3": True},
+            ),
+        ):
+            payload, exit_code = run_sam_preflight(model_id="facebook/sam3")
+
+        self.assertEqual(exit_code, 22)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["status"], SAM_PREFLIGHT_STATUS_MISSING_TOKEN)
+        self.assertEqual(payload["error_kind"], ERROR_KIND_MODEL_ACCESS)
+        self.assertFalse(payload["token_configured"])
+
+    def test_sam_preflight_missing_transformers_support_returns_24(self) -> None:
+        with (
+            mock.patch("falcon_pipeline_realtime_service.huggingface_token", return_value="hf_test"),
+            mock.patch(
+                "falcon_pipeline_realtime_service.inspect_torch_stack",
+                return_value={"cuda_available": True, "transformers_available": True, "has_sam3": False},
+            ),
+        ):
+            payload, exit_code = run_sam_preflight(model_id="facebook/sam3")
+
+        self.assertEqual(exit_code, 24)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["status"], SAM_PREFLIGHT_STATUS_UNSUPPORTED)
+        self.assertEqual(payload["error_kind"], ERROR_KIND_MODEL_UNSUPPORTED)
+        self.assertFalse(payload["transformers_sam3_available"])
+
+    def test_sam_preflight_success_returns_zero(self) -> None:
+        with (
+            mock.patch("falcon_pipeline_realtime_service.huggingface_token", return_value="hf_test"),
+            mock.patch(
+                "falcon_pipeline_realtime_service.inspect_torch_stack",
+                return_value={"cuda_available": True, "transformers_available": True, "has_sam3": True},
+            ),
+            mock.patch(
+                "falcon_pipeline_realtime_service.load_sam3_runtime",
+                return_value={"model": object(), "device": "cuda"},
+            ) as mock_load,
+        ):
+            payload, exit_code = run_sam_preflight(model_id="facebook/sam3")
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"], SAM_PREFLIGHT_STATUS_READY)
+        self.assertIsNone(payload["error_kind"])
+        self.assertEqual(payload["device"], "cuda")
+        mock_load.assert_called_once_with("facebook/sam3", allow_experimental_non_cuda=False)
+
+    def test_sam_preflight_access_error_returns_23(self) -> None:
+        with (
+            mock.patch("falcon_pipeline_realtime_service.huggingface_token", return_value="hf_test"),
+            mock.patch(
+                "falcon_pipeline_realtime_service.inspect_torch_stack",
+                return_value={"cuda_available": True, "transformers_available": True, "has_sam3": True},
+            ),
+            mock.patch(
+                "falcon_pipeline_realtime_service.load_sam3_runtime",
+                side_effect=ModelAccessError("model_access: approval required"),
+            ),
+        ):
+            payload, exit_code = run_sam_preflight(model_id="facebook/sam3")
+
+        self.assertEqual(exit_code, 23)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["status"], SAM_PREFLIGHT_STATUS_ACCESS_REQUIRED)
+        self.assertEqual(payload["error_kind"], ERROR_KIND_MODEL_ACCESS)
+
+    def test_sam_preflight_unsupported_error_returns_24(self) -> None:
+        with (
+            mock.patch("falcon_pipeline_realtime_service.huggingface_token", return_value="hf_test"),
+            mock.patch(
+                "falcon_pipeline_realtime_service.inspect_torch_stack",
+                return_value={"cuda_available": True, "transformers_available": True, "has_sam3": True},
+            ),
+            mock.patch(
+                "falcon_pipeline_realtime_service.load_sam3_runtime",
+                side_effect=ModelUnsupportedError("model_unsupported: unsupported architecture"),
+            ),
+        ):
+            payload, exit_code = run_sam_preflight(model_id="facebook/sam3.1")
+
+        self.assertEqual(exit_code, 24)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["status"], SAM_PREFLIGHT_STATUS_UNSUPPORTED)
+        self.assertEqual(payload["error_kind"], ERROR_KIND_MODEL_UNSUPPORTED)
+
+    def test_sam_preflight_generic_load_error_returns_25(self) -> None:
+        with (
+            mock.patch("falcon_pipeline_realtime_service.huggingface_token", return_value="hf_test"),
+            mock.patch(
+                "falcon_pipeline_realtime_service.inspect_torch_stack",
+                return_value={"cuda_available": True, "transformers_available": True, "has_sam3": True},
+            ),
+            mock.patch(
+                "falcon_pipeline_realtime_service.load_sam3_runtime",
+                side_effect=RuntimeError("CUDA out of memory"),
+            ),
+        ):
+            payload, exit_code = run_sam_preflight(model_id="facebook/sam3")
+
+        self.assertEqual(exit_code, 25)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["status"], SAM_PREFLIGHT_STATUS_LOAD_FAILED)
+        self.assertEqual(payload["error_kind"], ERROR_KIND_MODEL_LOAD)
 
     def test_falcon_guidance_loop_refreshes_guidance_in_background(self) -> None:
         class FakeFalconRuntime:
