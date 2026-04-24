@@ -225,6 +225,43 @@ class RealtimeServiceTests(unittest.TestCase):
         self.assertTrue(state["frame"]["ready"])
         self.assertFalse(state["frame"]["is_placeholder"])
 
+    def test_recent_sam3_overlay_stays_ready_while_next_mask_is_segmenting(self) -> None:
+        service = self.make_service(
+            source_url="https://www.youtube.com/watch?v=example",
+            load_rtdetr=True,
+        )
+        self.mark_models_loaded(service)
+        service._set_metric("capture_state", "running")
+        service._set_metric("pipeline_state", "running")
+        service._set_metric("sam3_segmentation_state", "segmenting")
+        overlay = np.zeros((32, 32, 3), dtype=np.uint8)
+        service._set_latest_overlay(
+            overlay,
+            {
+                "primary_engine": "sam3",
+                "generation_seconds": 0.25,
+                "detections": [
+                    {
+                        "index": 0,
+                        "center": {"x": 0.5, "y": 0.5},
+                        "height": 0.2,
+                        "width": 0.1,
+                        "has_mask": True,
+                        "engine": "sam3",
+                        "label": "person",
+                    }
+                ],
+                "bboxes": [{"x": 0.5, "y": 0.5, "w": 0.1, "h": 0.2}],
+                "masks_rle": [],
+                "num_masks": 0,
+            },
+        )
+
+        state = service.get_state()
+        self.assertEqual(state["readiness"]["service_state"], "live")
+        self.assertTrue(state["readiness"]["full_pipeline_ready"])
+        self.assertTrue(state["readiness"]["sam3_visual_ready"])
+
     def test_live_overlay_with_blocking_engine_error_is_not_full_pipeline_ready(self) -> None:
         service = self.make_service(
             source_url="https://www.youtube.com/watch?v=example",

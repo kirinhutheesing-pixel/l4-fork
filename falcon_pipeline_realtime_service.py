@@ -910,7 +910,7 @@ class FalconPipelineRealtimeService:
     def _sam3_visual_ready(self, result: dict[str, Any], metrics: dict[str, Any]) -> bool:
         if result.get("primary_engine") != "sam3":
             return False
-        if metrics.get("sam3_segmentation_state") != "ready":
+        if metrics.get("sam3_segmentation_state") not in {"ready", "segmenting"}:
             return False
         return bool(result.get("detections") or result.get("masks_rle") or result.get("num_masks"))
 
