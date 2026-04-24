@@ -320,7 +320,7 @@
     <section class="hero">
       <p class="eyebrow">Realtime CUDA Build</p>
       <h1>Falcon Pipeline</h1>
-      <p>This interface is designed for a Google Cloud L4 deployment: RT-DETR carries the per-frame backbone, SAM 3 refines masks when enabled, and Falcon Perception acts as the natural-language orchestration layer behind the prompt box.</p>
+      <p>This interface is designed for a Google Cloud L4 deployment: RT-DETR carries hidden per-frame guidance, SAM 3 produces the visible color overlay, and Falcon Perception acts as the natural-language orchestration layer behind the prompt box.</p>
     </section>
 
     <div class="grid">
@@ -389,7 +389,7 @@
           </div>
         </form>
         <div class="notes">
-          SAM 3 segmentation must be loaded at service startup. In segmentation mode, RT-DETR supplies live boxes, Falcon refreshes guidance in the background, and SAM 3 becomes the visible overlay once masks are ready.
+          SAM 3 segmentation must be loaded at service startup. In segmentation mode, RT-DETR supplies hidden guidance boxes, Falcon refreshes guidance in the background, and SAM 3 provides the visible color overlay once masks are ready.
         </div>
         <div class="status-line" id="statusLine">Loading runtime state...</div>
       </section>
@@ -420,6 +420,21 @@
   <script>
     const form = document.getElementById("sessionForm");
     const applyPromptOnly = document.getElementById("applyPromptOnly");
+    const pendingControlEdits = new Set();
+
+    ["sourceUrl", "prompt", "maxDim", "falconRefresh"].forEach((id) => {
+      const element = document.getElementById(id);
+      element.addEventListener("focus", () => pendingControlEdits.add(id));
+      element.addEventListener("input", () => pendingControlEdits.add(id));
+    });
+
+    function syncControlValue(id, value) {
+      const element = document.getElementById(id);
+      if (document.activeElement === element || pendingControlEdits.has(id)) {
+        return;
+      }
+      element.value = value;
+    }
 
     function metricText(value, fallback = "...") {
       if (value === null || value === undefined || value === "") {
@@ -477,11 +492,11 @@
       const detections = result.detections || [];
       const primaryEngine = (result.primary_engine || "warming").replaceAll("_", "-").toUpperCase();
 
-      document.getElementById("sourceUrl").value = session.source_url || "";
-      document.getElementById("prompt").value = session.prompt || "";
+      syncControlValue("sourceUrl", session.source_url || "");
+      syncControlValue("prompt", session.prompt || "");
       document.getElementById("runtimeMode").value = `${(session.task || "segmentation").toUpperCase()} / SAM 3 required`;
-      document.getElementById("maxDim").value = session.max_dim || 960;
-      document.getElementById("falconRefresh").value = session.falcon_refresh_seconds || 5.0;
+      syncControlValue("maxDim", session.max_dim || 960);
+      syncControlValue("falconRefresh", session.falcon_refresh_seconds || 5.0);
 
       document.getElementById("metricEngine").textContent = primaryEngine;
       document.getElementById("metricCount").textContent = metricText(detections.length, "0");
@@ -518,6 +533,7 @@
         body: JSON.stringify(payload),
       });
       const state = await response.json();
+      pendingControlEdits.clear();
       applyState(state);
     }
 

@@ -9,6 +9,7 @@ from unittest import mock
 
 import numpy as np
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from falcon_perception import PERCEPTION_300M_MODEL_ID
 from falcon_pipeline_realtime_service import (
@@ -271,6 +272,70 @@ class RealtimeServiceTests(unittest.TestCase):
         self.assertEqual(state["readiness"]["service_state"], "live")
         self.assertTrue(state["readiness"]["full_pipeline_ready"])
         self.assertTrue(state["readiness"]["sam3_visual_ready"])
+
+    def test_render_overlay_never_sends_detection_boxes_to_visualizer(self) -> None:
+        service = self.make_service(source_url="https://www.youtube.com/watch?v=example")
+        frame = np.zeros((160, 160, 3), dtype=np.uint8)
+
+        with mock.patch("falcon_pipeline_realtime_service.render_visualization") as render:
+            render.return_value = Image.fromarray(np.zeros((160, 160, 3), dtype=np.uint8))
+            service._render_overlay(
+                frame,
+                {
+                    "primary_engine": "rt_detr",
+                    "detections": [],
+                    "bboxes": [{"x": 0.5, "y": 0.5, "w": 0.5, "h": 0.5}],
+                    "masks_rle": [],
+                },
+                service.session,
+            )
+
+        self.assertEqual(render.call_args.args[1], [])
+
+    def test_render_overlay_uses_role_colored_masks_without_entity_rectangles(self) -> None:
+        service = self.make_service(source_url="https://www.youtube.com/watch?v=example")
+        frame = np.zeros((200, 200, 3), dtype=np.uint8)
+        mask = np.zeros((200, 200), dtype=np.uint8)
+        mask[145:165, 95:105] = 1
+
+        with (
+            mock.patch("falcon_pipeline_realtime_service.render_visualization") as render,
+            mock.patch("falcon_pipeline_realtime_service.decode_rle_mask", return_value=mask),
+        ):
+            render.return_value = Image.fromarray(np.zeros((200, 200, 3), dtype=np.uint8))
+            overlay = service._render_overlay(
+                frame,
+                {
+                    "primary_engine": "sam3",
+                    "detections": [
+                        {
+                            "index": 0,
+                            "center": {"x": 0.5, "y": 0.775},
+                            "width": 0.1,
+                            "height": 0.15,
+                            "has_mask": True,
+                        }
+                    ],
+                    "masks_rle": [{"counts": "mock", "size": [200, 200]}],
+                    "scene_annotations": {
+                        "profile": "restaurant_service",
+                        "counts": {"needs_service": 1},
+                        "entities": [
+                            {
+                                "kind": "person",
+                                "role": "restaurant_goer",
+                                "needs_service": True,
+                                "bbox": {"x": 0.5, "y": 0.775, "w": 0.1, "h": 0.15},
+                            }
+                        ],
+                    },
+                },
+                service.session,
+            )
+
+        self.assertGreater(overlay[155, 100, 2], 70)
+        self.assertGreater(overlay[155, 100, 2], overlay[155, 100, 0])
+        self.assertTrue(np.all(overlay[140, 90] == 0))
 
     def test_live_overlay_with_blocking_engine_error_is_not_full_pipeline_ready(self) -> None:
         service = self.make_service(

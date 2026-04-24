@@ -49,6 +49,7 @@ from perception_orchestrator import (  # noqa: E402
 from run_falcon_pipeline import (  # noqa: E402
     DEFAULT_CACHE_DIR,
     configure_huggingface_cache,
+    decode_rle_mask,
     is_youtube_url,
     make_slug,
     open_video_capture,
@@ -133,19 +134,6 @@ def resize_image_to_bounds(image: Image.Image, *, min_dim: int, max_dim: int) ->
     return image.resize(new_size, Image.Resampling.BICUBIC)
 
 
-def detection_bbox_xyxy(detection: dict[str, Any], width: int, height: int) -> tuple[int, int, int, int]:
-    center = detection.get("center") or {}
-    cx = float(center.get("x", 0.5)) * width
-    cy = float(center.get("y", 0.5)) * height
-    bw = float(detection.get("width", 0.0)) * width
-    bh = float(detection.get("height", 0.0)) * height
-    x0 = int(round(cx - bw / 2.0))
-    y0 = int(round(cy - bh / 2.0))
-    x1 = int(round(cx + bw / 2.0))
-    y1 = int(round(cy + bh / 2.0))
-    return x0, y0, x1, y1
-
-
 def bbox_norm_xyxy(bbox: dict[str, float], width: int, height: int) -> tuple[int, int, int, int]:
     cx = float(bbox.get("x", 0.5)) * width
     cy = float(bbox.get("y", 0.5)) * height
@@ -219,6 +207,112 @@ def entity_color_bgr(entity: dict[str, Any]) -> tuple[int, int, int]:
     if role == "unclassified":
         return RESTAURANT_ROLE_COLORS["unclassified"]
     return RESTAURANT_ROLE_COLORS["restaurant_goer"]
+
+
+def detection_mask_index(detection: dict[str, Any], position: int, mask_count: int) -> int | None:
+    try:
+        index = int(detection.get("index", position))
+    except (TypeError, ValueError):
+        index = position
+    if 0 <= index < mask_count:
+        return index
+    if 0 <= position < mask_count:
+        return position
+    return None
+
+
+def match_entity_masks(
+    entities: list[dict[str, Any]],
+    detections: list[dict[str, Any]],
+    mask_count: int,
+    *,
+    threshold: float = 0.05,
+) -> dict[int, int]:
+    matches: dict[int, int] = {}
+    used_masks: set[int] = set()
+    for entity_index, entity in enumerate(entities):
+        bbox = entity.get("bbox") or {}
+        if not bbox:
+            continue
+        best_mask_index: int | None = None
+        best_overlap = threshold
+        for detection_position, detection in enumerate(detections):
+            if detection.get("has_mask") is False:
+                continue
+            mask_index = detection_mask_index(detection, detection_position, mask_count)
+            if mask_index is None or mask_index in used_masks:
+                continue
+            overlap = intersection_over_union(bbox, detection_bbox_norm(detection))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_mask_index = mask_index
+        if best_mask_index is not None:
+            matches[entity_index] = best_mask_index
+            used_masks.add(best_mask_index)
+    return matches
+
+
+def apply_color_mask(
+    overlay_bgr: np.ndarray,
+    mask: np.ndarray,
+    color_bgr: tuple[int, int, int],
+    *,
+    alpha: float = 0.36,
+) -> bool:
+    height, width = overlay_bgr.shape[:2]
+    if mask.ndim == 3:
+        mask = mask[..., 0]
+    if mask.shape != (height, width):
+        mask = cv2.resize(mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST)
+
+    region = mask > 0
+    if not np.any(region):
+        return False
+
+    color = np.array(color_bgr, dtype=np.float32)
+    base_pixels = overlay_bgr[region].astype(np.float32)
+    overlay_bgr[region] = (base_pixels * (1.0 - alpha) + color * alpha).clip(0, 255).astype(np.uint8)
+
+    contours, _ = cv2.findContours(region.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        cv2.drawContours(overlay_bgr, contours, -1, color_bgr, 2, cv2.LINE_AA)
+    return True
+
+
+def apply_entity_role_masks(
+    overlay_bgr: np.ndarray,
+    *,
+    entities: list[dict[str, Any]],
+    detections: list[dict[str, Any]],
+    masks_rle: list[dict[str, Any]],
+) -> set[int]:
+    matched_entities: set[int] = set()
+    matches = match_entity_masks(entities, detections, len(masks_rle))
+    for entity_index, mask_index in matches.items():
+        mask = decode_rle_mask(masks_rle[mask_index])
+        if mask is None:
+            continue
+        if apply_color_mask(overlay_bgr, mask, entity_color_bgr(entities[entity_index])):
+            matched_entities.add(entity_index)
+    return matched_entities
+
+
+def draw_entity_color_marker(
+    overlay_bgr: np.ndarray,
+    entity: dict[str, Any],
+    *,
+    width: int,
+    height: int,
+) -> None:
+    bbox = entity.get("bbox") or {}
+    x0, y0, x1, y1 = bbox_norm_xyxy(bbox, width, height)
+    cx = int(np.clip(round((x0 + x1) / 2.0), 0, width - 1))
+    cy = int(np.clip(round((y0 + y1) / 2.0), 0, height - 1))
+    color = entity_color_bgr(entity)
+    radius = 11 if entity.get("kind") == "person" else 9
+    if entity.get("needs_service"):
+        cv2.circle(overlay_bgr, (cx, cy), radius + 8, color, 2, cv2.LINE_AA)
+    cv2.circle(overlay_bgr, (cx, cy), radius, color, -1, cv2.LINE_AA)
 
 
 def infer_source_type(source_url: str) -> str | None:
@@ -1515,21 +1609,30 @@ class FalconPipelineRealtimeService:
     ) -> np.ndarray:
         scene_annotations = inference.get("scene_annotations") or {}
         entities = scene_annotations.get("entities") or []
+        detections = inference.get("detections") or []
+        masks_rle = inference.get("masks_rle") or []
         overlay_pil = render_visualization(
             Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)),
-            [] if entities else (inference.get("bboxes") or []),
-            inference.get("masks_rle") or [],
+            [],
+            [] if entities else masks_rle,
             interior_opacity=0.22,
             border_thickness=2,
         )
         overlay_bgr = cv2.cvtColor(np.array(overlay_pil), cv2.COLOR_RGB2BGR)
         height, width = overlay_bgr.shape[:2]
+        matched_entity_indexes: set[int] = set()
+        if entities:
+            matched_entity_indexes = apply_entity_role_masks(
+                overlay_bgr,
+                entities=entities,
+                detections=detections,
+                masks_rle=masks_rle,
+            )
 
         header = overlay_bgr.copy()
         cv2.rectangle(header, (0, 0), (width, 124), (20, 47, 48), -1)
         overlay_bgr = cv2.addWeighted(header, 0.42, overlay_bgr, 0.58, 0.0)
 
-        detections = inference.get("detections") or []
         primary_engine = str(inference.get("primary_engine") or "falcon").replace("_", "-").upper()
         latency = inference.get("generation_seconds")
         latency_label = "n/a" if latency is None else f"{float(latency):.2f}s"
@@ -1571,64 +1674,10 @@ class FalconPipelineRealtimeService:
             )
             y += 32
 
-        for entity in entities[:48]:
-            bbox = entity.get("bbox") or {}
-            x0, y0, x1, y1 = bbox_norm_xyxy(bbox, width, height)
-            color = entity_color_bgr(entity)
-            role = str(entity.get("role") or entity.get("kind") or "entity").replace("_", " ")
-            if entity.get("needs_service"):
-                role = f"{role} needs service"
-            cv2.rectangle(overlay_bgr, (x0, y0), (x1, y1), color, 2)
-            text = role.upper()
-            text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.56, 2)
-            text_width, text_height = text_size
-            label_y = max(y0 - 10, 24)
-            cv2.rectangle(
-                overlay_bgr,
-                (x0, label_y - text_height - 10),
-                (x0 + text_width + 12, label_y + 4),
-                color,
-                -1,
-            )
-            cv2.putText(
-                overlay_bgr,
-                text,
-                (x0 + 6, label_y - 4),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.56,
-                (255, 249, 237),
-                2,
-                cv2.LINE_AA,
-            )
-
-        for detection in ([] if entities else detections[:24]):
-            x0, y0, x1, y1 = detection_bbox_xyxy(detection, width, height)
-            label = detection.get("label") or session.prompt
-            score = detection.get("score")
-            if score is None:
-                text = str(label)
-            else:
-                text = f"{label} {float(score):.2f}"
-            text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.56, 2)
-            text_width, text_height = text_size
-            label_y = max(y0 - 10, 24)
-            cv2.rectangle(
-                overlay_bgr,
-                (x0, label_y - text_height - 10),
-                (x0 + text_width + 12, label_y + 4),
-                (13, 124, 119),
-                -1,
-            )
-            cv2.putText(
-                overlay_bgr,
-                text,
-                (x0 + 6, label_y - 4),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.56,
-                (255, 249, 237),
-                2,
-                cv2.LINE_AA,
-            )
+        for entity_index, entity in enumerate(entities[:48]):
+            if entity_index in matched_entity_indexes:
+                continue
+            draw_entity_color_marker(overlay_bgr, entity, width=width, height=height)
 
         return overlay_bgr
 

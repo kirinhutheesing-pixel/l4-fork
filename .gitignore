@@ -12,4 +12,5 @@ outputs/
 .tmp/
 .tmp-tests/
 .tmp-*-tunnel*.log
+tunnel-*.log
 .gcloud-config-l4*/
