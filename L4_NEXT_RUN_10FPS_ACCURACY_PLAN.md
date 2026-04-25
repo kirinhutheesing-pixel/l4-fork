@@ -2,6 +2,13 @@
 
 This plan is based on the April 24 SAM3 L4 run. That run proved source ingest, Falcon, RT-DETR, SAM3, Docker, and the browser path can work on the L4. It also proved the current architecture is not a 10 FPS video pipeline.
 
+Status after local hardening:
+- P0 cached-overlay runtime has been implemented locally
+- `/api/frame.jpg` now returns cached JPEG output without synchronously running RT-DETR, SAM3, or Falcon
+- `/api/state` now exposes loop FPS, freshness, render/encode timing, response timing, and best-effort GPU telemetry
+- `scripts/gcp/measure_realtime_fps.py` is the next VM measurement command
+- the next VM run must prove the actual FPS target on the L4; local unit tests prove the contract, not live throughput
+
 ## Current baseline
 
 Observed on the L4 VM:

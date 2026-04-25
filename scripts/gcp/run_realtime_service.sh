@@ -18,6 +18,8 @@ FALCON_MIN_DIM="${FALCON_MIN_DIM:-256}"
 FALCON_MAX_DIM="${FALCON_MAX_DIM:-640}"
 FALCON_MAX_NEW_TOKENS="${FALCON_MAX_NEW_TOKENS:-128}"
 FALCON_REFRESH_SECONDS="${FALCON_REFRESH_SECONDS:-5.0}"
+DISPLAY_MAX_FPS="${DISPLAY_MAX_FPS:-15.0}"
+SAM3_REFRESH_SECONDS="${SAM3_REFRESH_SECONDS:-1.0}"
 
 if [[ -z "${HF_TOKEN:-}" && -z "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
   echo "SAM 3 is mandatory, but no HF_TOKEN or HUGGING_FACE_HUB_TOKEN is set." >&2
@@ -68,6 +70,8 @@ service_runtime_args=(
   --falcon-max-dim "${FALCON_MAX_DIM}"
   --falcon-max-new-tokens "${FALCON_MAX_NEW_TOKENS}"
   --falcon-refresh-seconds "${FALCON_REFRESH_SECONDS}"
+  --display-max-fps "${DISPLAY_MAX_FPS}"
+  --sam3-refresh-seconds "${SAM3_REFRESH_SECONDS}"
   --sam3-model-id "${SAM3_MODEL_ID}"
 )
 

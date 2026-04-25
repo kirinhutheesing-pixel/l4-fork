@@ -510,8 +510,9 @@
 
       document.getElementById("metricEngine").textContent = primaryEngine;
       document.getElementById("metricCount").textContent = metricText(detections.length, "0");
-      document.getElementById("metricLatency").textContent = result.generation_seconds ? `${Number(result.generation_seconds).toFixed(2)}s` : "...";
-      document.getElementById("metricFps").textContent = metrics.processed_fps ? Number(metrics.processed_fps).toFixed(2) : "0.00";
+      document.getElementById("metricLatency").textContent = metrics.frame_response_ms ? `${Number(metrics.frame_response_ms).toFixed(1)}ms` : "...";
+      const visualFps = metrics.display_frame_fps || metrics.frame_response_fps || metrics.processed_fps || 0;
+      document.getElementById("metricFps").textContent = Number(visualFps).toFixed(2);
       document.getElementById("videoBadge").textContent = `${metricText(metrics.capture_state, "idle")} / ${metricText(metrics.pipeline_state, "warming_up")}`;
 
       const streamTitle = state.stream && (state.stream.title || state.stream.requested_url) ? `Source: ${state.stream.title || state.stream.requested_url}` : "Source: not connected yet";
@@ -524,7 +525,10 @@
       const sam3Line = state.sam3_available
         ? `SAM 3 ${sam3State}${sam3Age}`
         : (state.sam3_load_error ? `SAM 3 unavailable: ${state.sam3_load_error}` : "SAM 3 loading or unavailable");
-      document.getElementById("statusLine").textContent = `${streamTitle} | Visual: ${primaryEngine} | ${sam3Line} | Ready: ${readiness.full_pipeline_ready === true}${errorLine}`;
+      const gpuLine = metrics.gpu_utilization_percent === null || metrics.gpu_utilization_percent === undefined
+        ? "GPU: n/a"
+        : `GPU: ${Number(metrics.gpu_utilization_percent).toFixed(0)}%, ${Number(metrics.gpu_memory_used_mb || 0).toFixed(0)} MB`;
+      document.getElementById("statusLine").textContent = `${streamTitle} | Visual: ${primaryEngine} | ${sam3Line} | ${gpuLine} | Ready: ${readiness.full_pipeline_ready === true}${errorLine}`;
 
       renderGuidelines(state.guidelines || []);
       renderDetections(detections);

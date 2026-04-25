@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import subprocess
 import sys
 import threading
 import time
@@ -633,6 +634,65 @@ def placeholder_frame(message: str) -> bytes:
     return encode_jpeg(canvas)
 
 
+def fps_from_timestamps(timestamps: deque[float]) -> float:
+    if len(timestamps) < 2:
+        return 0.0
+    elapsed = timestamps[-1] - timestamps[0]
+    if elapsed <= 0:
+        return 0.0
+    return round((len(timestamps) - 1) / elapsed, 2)
+
+
+def age_seconds(timestamp: float | None, now: float | None = None) -> float | None:
+    if timestamp is None:
+        return None
+    current = time.time() if now is None else now
+    return round(max(0.0, current - timestamp), 3)
+
+
+def bboxes_materially_changed(
+    previous: list[dict[str, float]] | None,
+    current: list[dict[str, float]],
+    *,
+    iou_threshold: float = 0.7,
+) -> bool:
+    if previous is None:
+        return True
+    if len(previous) != len(current):
+        return True
+    if not previous and not current:
+        return False
+    unmatched = list(current)
+    for prior in previous:
+        best_index = -1
+        best_iou = 0.0
+        for index, candidate in enumerate(unmatched):
+            iou = intersection_over_union(prior, candidate)
+            if iou > best_iou:
+                best_iou = iou
+                best_index = index
+        if best_index < 0 or best_iou < iou_threshold:
+            return True
+        unmatched.pop(best_index)
+    return False
+
+
+def compact_engine_output(output: dict[str, Any] | None) -> dict[str, Any] | None:
+    if output is None:
+        return None
+    return {
+        "engine": output.get("engine"),
+        "model_id": output.get("model_id"),
+        "device": output.get("device"),
+        "generation_seconds": output.get("generation_seconds"),
+        "detections_count": len(output.get("detections") or []),
+        "bboxes_count": len(output.get("bboxes") or []),
+        "num_masks": int(output.get("num_masks") or 0),
+        "masks_rle_count": len(output.get("masks_rle") or []),
+        "prompt_boxes_count": output.get("prompt_boxes_count"),
+    }
+
+
 def falcon_task_for_live_prompt(task: str) -> str:
     return "detection" if task in {"detection", "segmentation"} else task
 
@@ -656,6 +716,8 @@ class LiveSessionConfig:
     stream_open_timeout: float = 60.0
     stream_read_timeout: float = 20.0
     jpeg_quality: int = 85
+    display_max_fps: float = 15.0
+    sam3_refresh_seconds: float = 1.0
 
     def __post_init__(self) -> None:
         self.task = "segmentation"
@@ -815,14 +877,24 @@ class FalconPipelineRealtimeService:
         )
         self.latest_frame: np.ndarray | None = None
         self.latest_frame_id = 0
+        self.latest_raw_frame_at: float | None = None
         self.prompt_revision = 0
         self.latest_falcon_guidance: FalconGuidance | None = None
         self.latest_falcon_error: str | None = None
+        self.latest_rtdetr_inference: dict[str, Any] | None = None
+        self.latest_rtdetr_error: str | None = None
+        self.latest_rtdetr_frame_id: int | None = None
+        self.latest_rtdetr_at: float | None = None
         self.latest_sam3_guidance: Sam3Guidance | None = None
         self.latest_sam3_error: str | None = None
         self.latest_sam3_request: Sam3Request | None = None
+        self.latest_sam3_prompt_bboxes: list[dict[str, float]] | None = None
+        self.latest_sam3_request_at: float | None = None
         self.latest_result: dict[str, Any] = {}
+        self.latest_result_at: float | None = None
         self.latest_jpeg: bytes = b""
+        self.latest_overlay_at: float | None = None
+        self.latest_overlay_frame_id: int | None = None
         self.latest_frame_is_placeholder = True
         self.latest_frame_note = "Waiting for a stream source."
         self.latest_metrics: dict[str, Any] = {
@@ -830,16 +902,47 @@ class FalconPipelineRealtimeService:
             "pipeline_state": "warming_up",
             "last_error": None,
             "processed_fps": 0.0,
+            "capture_fps": 0.0,
+            "display_frame_fps": 0.0,
+            "frame_response_fps": 0.0,
+            "rtdetr_fps": 0.0,
+            "sam3_fps": 0.0,
+            "falcon_fps": 0.0,
             "last_processed_at": None,
             "latest_generation_seconds": None,
             "falcon_guidance_state": "idle",
             "falcon_guidance_age_seconds": None,
             "falcon_guidance_generation_seconds": None,
+            "falcon_generation_ms": None,
+            "rtdetr_state": "idle",
+            "rtdetr_age_seconds": None,
+            "rtdetr_generation_seconds": None,
+            "rtdetr_generation_ms": None,
             "sam3_segmentation_state": "idle",
             "sam3_segmentation_age_seconds": None,
             "sam3_segmentation_generation_seconds": None,
+            "sam3_generation_ms": None,
+            "latest_raw_frame_age_seconds": None,
+            "latest_overlay_age_seconds": None,
+            "latest_sam3_mask_age_seconds": None,
+            "latest_rtdetr_age_seconds": None,
+            "latest_falcon_guidance_age_seconds": None,
+            "capture_latency_ms": None,
+            "overlay_render_ms": None,
+            "jpeg_encode_ms": None,
+            "frame_response_ms": None,
+            "gpu_utilization_percent": None,
+            "gpu_memory_used_mb": None,
+            "gpu_telemetry_error": None,
+            "model_queue_wait_ms": None,
         }
         self.processed_timestamps: deque[float] = deque(maxlen=40)
+        self.capture_timestamps: deque[float] = deque(maxlen=120)
+        self.display_timestamps: deque[float] = deque(maxlen=120)
+        self.frame_response_timestamps: deque[float] = deque(maxlen=120)
+        self.rtdetr_timestamps: deque[float] = deque(maxlen=80)
+        self.sam3_timestamps: deque[float] = deque(maxlen=40)
+        self.falcon_timestamps: deque[float] = deque(maxlen=20)
         self.falcon_runtime: FalconRealtimeRuntime | None = None
         self.falcon_load_error: str | None = None
         self.rtdetr_runtime: dict[str, Any] | None = None
@@ -881,6 +984,8 @@ class FalconPipelineRealtimeService:
             threading.Thread(target=self._falcon_guidance_loop, name="falcon-guidance", daemon=True),
             threading.Thread(target=self._sam3_loop, name="falcon-sam3", daemon=True),
             threading.Thread(target=self._process_loop, name="falcon-process", daemon=True),
+            threading.Thread(target=self._display_loop, name="falcon-display", daemon=True),
+            threading.Thread(target=self._gpu_monitor_loop, name="falcon-gpu-monitor", daemon=True),
         ]
         for thread in self.threads:
             thread.start()
@@ -922,8 +1027,11 @@ class FalconPipelineRealtimeService:
             self.latest_jpeg = payload
             self.latest_frame_is_placeholder = True
             self.latest_frame_note = message
+            self.latest_overlay_at = None
+            self.latest_overlay_frame_id = None
             if clear_result:
                 self.latest_result = {}
+                self.latest_result_at = None
 
     def _mark_live_frame(self) -> None:
         with self.lock:
@@ -1119,16 +1227,26 @@ class FalconPipelineRealtimeService:
                         "falcon_temperature",
                         "sam3_threshold",
                         "sam3_mask_threshold",
+                        "display_max_fps",
+                        "sam3_refresh_seconds",
                     }
             if guidance_changed:
                 self.prompt_revision += 1
                 self.latest_falcon_guidance = None
                 self.latest_falcon_error = None
+                self.latest_rtdetr_inference = None
+                self.latest_rtdetr_error = None
+                self.latest_rtdetr_frame_id = None
+                self.latest_rtdetr_at = None
                 self.latest_sam3_guidance = None
                 self.latest_sam3_error = None
                 self.latest_sam3_request = None
+                self.latest_sam3_prompt_bboxes = None
+                self.latest_sam3_request_at = None
                 self.latest_metrics["falcon_guidance_state"] = "idle"
                 self.latest_metrics["falcon_guidance_age_seconds"] = None
+                self.latest_metrics["rtdetr_state"] = "idle"
+                self.latest_metrics["rtdetr_age_seconds"] = None
                 self.session.task = "segmentation"
                 self.session.enable_sam3 = True
                 self.latest_metrics["sam3_segmentation_state"] = "idle"
@@ -1137,14 +1255,29 @@ class FalconPipelineRealtimeService:
                 self.capture_source_key = None
                 self.stream_info = None
                 self.latest_frame = None
+                self.latest_raw_frame_at = None
                 self.latest_result = {}
+                self.latest_result_at = None
+                self.latest_overlay_at = None
+                self.latest_overlay_frame_id = None
                 self.latest_metrics["capture_state"] = "reconnecting"
                 self.latest_metrics["pipeline_state"] = "waiting_for_source"
                 self.latest_metrics["last_processed_at"] = None
                 self.latest_metrics["latest_generation_seconds"] = None
                 self.latest_metrics["processed_fps"] = 0.0
+                self.latest_metrics["capture_fps"] = 0.0
+                self.latest_metrics["display_frame_fps"] = 0.0
+                self.latest_metrics["frame_response_fps"] = 0.0
+                self.latest_metrics["latest_raw_frame_age_seconds"] = None
+                self.latest_metrics["latest_overlay_age_seconds"] = None
                 self.latest_frame_is_placeholder = True
                 self.latest_frame_note = "Switching stream source."
+                self.capture_timestamps.clear()
+                self.display_timestamps.clear()
+                self.frame_response_timestamps.clear()
+                self.rtdetr_timestamps.clear()
+                self.sam3_timestamps.clear()
+                self.falcon_timestamps.clear()
                 self.latest_source_state = build_source_state(
                     input_url=self.session.source_url,
                     source_type=infer_source_type(self.session.source_url),
@@ -1155,10 +1288,47 @@ class FalconPipelineRealtimeService:
                 self._set_placeholder_frame("Switching stream source.", clear_result=True)
         return self.get_state()
 
-    def get_state(self) -> dict[str, Any]:
+    def _compact_result_for_state(self, result: dict[str, Any], *, debug: bool = False) -> dict[str, Any]:
+        if debug:
+            return copy.deepcopy(result)
+        compact = copy.deepcopy(result)
+        if "masks_rle" in compact:
+            compact["masks_rle_count"] = len(compact.get("masks_rle") or [])
+            compact.pop("masks_rle", None)
+        engine_outputs = compact.get("engine_outputs")
+        if isinstance(engine_outputs, dict):
+            compact["engine_outputs"] = {
+                name: compact_engine_output(output)
+                for name, output in engine_outputs.items()
+                if output is not None
+            }
+        return compact
+
+    def get_state(self, *, debug: bool = False) -> dict[str, Any]:
+        now = time.time()
         with self.lock:
             result = copy.deepcopy(self.latest_result)
             metrics = copy.deepcopy(self.latest_metrics)
+            metrics["capture_fps"] = fps_from_timestamps(self.capture_timestamps)
+            metrics["display_frame_fps"] = fps_from_timestamps(self.display_timestamps)
+            metrics["frame_response_fps"] = fps_from_timestamps(self.frame_response_timestamps)
+            metrics["rtdetr_fps"] = fps_from_timestamps(self.rtdetr_timestamps)
+            metrics["sam3_fps"] = fps_from_timestamps(self.sam3_timestamps)
+            metrics["falcon_fps"] = fps_from_timestamps(self.falcon_timestamps)
+            metrics["latest_raw_frame_age_seconds"] = age_seconds(self.latest_raw_frame_at, now)
+            metrics["latest_overlay_age_seconds"] = age_seconds(self.latest_overlay_at, now)
+            metrics["latest_sam3_mask_age_seconds"] = age_seconds(
+                None if self.latest_sam3_guidance is None else self.latest_sam3_guidance.ran_at,
+                now,
+            )
+            metrics["latest_rtdetr_age_seconds"] = age_seconds(self.latest_rtdetr_at, now)
+            metrics["latest_falcon_guidance_age_seconds"] = age_seconds(
+                None if self.latest_falcon_guidance is None else self.latest_falcon_guidance.ran_at,
+                now,
+            )
+            metrics["falcon_guidance_age_seconds"] = metrics["latest_falcon_guidance_age_seconds"]
+            metrics["rtdetr_age_seconds"] = metrics["latest_rtdetr_age_seconds"]
+            metrics["sam3_segmentation_age_seconds"] = metrics["latest_sam3_mask_age_seconds"]
             session = copy.deepcopy(asdict(self.session))
             source = copy.deepcopy(self.latest_source_state)
             stream = copy.deepcopy(self.stream_info)
@@ -1202,7 +1372,7 @@ class FalconPipelineRealtimeService:
             "metrics": metrics,
             "source": source,
             "stream": stream,
-            "result": result,
+            "result": self._compact_result_for_state(result, debug=debug),
             "frame": frame,
             "readiness": readiness,
             "guidelines": PROMPT_GUIDELINES,
@@ -1220,18 +1390,62 @@ class FalconPipelineRealtimeService:
             },
         }
 
-    def _set_latest_overlay(self, overlay_bgr: np.ndarray, result: dict[str, Any]) -> None:
+    def _set_latest_result(self, result: dict[str, Any]) -> None:
         with self.lock:
-            self.latest_jpeg = encode_jpeg(overlay_bgr, quality=self.session.jpeg_quality)
-            self.latest_result = result
+            self.latest_result = copy.deepcopy(result)
+            self.latest_result_at = time.time()
             self.latest_metrics["pipeline_state"] = "running"
             self.latest_metrics["latest_generation_seconds"] = result.get("generation_seconds")
             self.latest_metrics["last_processed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+    def _publish_rendered_frame(
+        self,
+        payload: bytes,
+        result: dict[str, Any],
+        *,
+        frame_id: int | None,
+        overlay_render_ms: float | None,
+        jpeg_encode_ms: float | None,
+    ) -> None:
+        publish_time = time.time()
+        with self.lock:
+            self.latest_jpeg = payload
+            self.latest_result = copy.deepcopy(result)
+            self.latest_result_at = publish_time
+            self.latest_overlay_at = publish_time
+            self.latest_overlay_frame_id = frame_id
+            self.latest_frame_is_placeholder = False
+            self.latest_frame_note = None
+            self.latest_metrics["pipeline_state"] = "running"
+            self.latest_metrics["latest_generation_seconds"] = result.get("generation_seconds")
+            self.latest_metrics["last_processed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            self.latest_metrics["overlay_render_ms"] = None if overlay_render_ms is None else round(overlay_render_ms, 3)
+            self.latest_metrics["jpeg_encode_ms"] = None if jpeg_encode_ms is None else round(jpeg_encode_ms, 3)
+            self.display_timestamps.append(publish_time)
+            self.latest_metrics["display_frame_fps"] = fps_from_timestamps(self.display_timestamps)
+
+    def _set_latest_overlay(self, overlay_bgr: np.ndarray, result: dict[str, Any]) -> None:
+        encode_start = time.perf_counter()
+        payload = encode_jpeg(overlay_bgr, quality=self.session.jpeg_quality)
+        encode_ms = (time.perf_counter() - encode_start) * 1000.0
+        self._publish_rendered_frame(
+            payload,
+            result,
+            frame_id=None,
+            overlay_render_ms=None,
+            jpeg_encode_ms=encode_ms,
+        )
         self._mark_live_frame()
 
     def get_latest_jpeg(self) -> bytes:
+        start = time.perf_counter()
         with self.lock:
-            return bytes(self.latest_jpeg)
+            payload = bytes(self.latest_jpeg)
+            now = time.time()
+            self.frame_response_timestamps.append(now)
+            self.latest_metrics["frame_response_fps"] = fps_from_timestamps(self.frame_response_timestamps)
+            self.latest_metrics["frame_response_ms"] = round((time.perf_counter() - start) * 1000.0, 3)
+            return payload
 
     def _open_capture(
         self,
@@ -1298,11 +1512,18 @@ class FalconPipelineRealtimeService:
                 read_deadline_started = None
 
             assert self.capture is not None
+            read_start = time.perf_counter()
             ok, frame = self.capture.read()
+            capture_latency_ms = (time.perf_counter() - read_start) * 1000.0
             if ok and frame is not None and frame.size:
+                now = time.time()
                 with self.lock:
                     self.latest_frame = frame
                     self.latest_frame_id += 1
+                    self.latest_raw_frame_at = now
+                    self.capture_timestamps.append(now)
+                    self.latest_metrics["capture_fps"] = fps_from_timestamps(self.capture_timestamps)
+                    self.latest_metrics["capture_latency_ms"] = round(capture_latency_ms, 3)
                 read_deadline_started = None
                 continue
 
@@ -1354,6 +1575,7 @@ class FalconPipelineRealtimeService:
 
             try:
                 self._set_metric("falcon_guidance_state", "refreshing")
+                generation_start = time.perf_counter()
                 pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 model_image = resize_image_to_bounds(
                     pil_image,
@@ -1370,6 +1592,7 @@ class FalconPipelineRealtimeService:
                     max_new_tokens=session.falcon_max_new_tokens,
                     temperature=session.falcon_temperature,
                 )
+                generation_ms = (time.perf_counter() - generation_start) * 1000.0
                 guidance = FalconGuidance(
                     inference=falcon_inference,
                     ran_at=time.time(),
@@ -1382,6 +1605,9 @@ class FalconPipelineRealtimeService:
                     self.latest_metrics["falcon_guidance_state"] = "ready"
                     self.latest_metrics["falcon_guidance_age_seconds"] = 0.0
                     self.latest_metrics["falcon_guidance_generation_seconds"] = falcon_inference.get("generation_seconds")
+                    self.latest_metrics["falcon_generation_ms"] = round(generation_ms, 3)
+                    self.falcon_timestamps.append(guidance.ran_at)
+                    self.latest_metrics["falcon_fps"] = fps_from_timestamps(self.falcon_timestamps)
             except Exception as exc:
                 with self.lock:
                     self.latest_falcon_error = str(exc)
@@ -1401,6 +1627,25 @@ class FalconPipelineRealtimeService:
     ) -> None:
         if not prompt_bboxes:
             return
+        now = time.time()
+        with self.lock:
+            current_guidance = copy.deepcopy(self.latest_sam3_guidance)
+            previous_bboxes = copy.deepcopy(self.latest_sam3_prompt_bboxes)
+            last_request_at = self.latest_sam3_request_at
+            sam3_state = self.latest_metrics.get("sam3_segmentation_state")
+        stale = (
+            current_guidance is None
+            or current_guidance.prompt_revision != prompt_revision
+            or (now - current_guidance.ran_at) >= max(session.sam3_refresh_seconds, 0.2)
+        )
+        changed = bboxes_materially_changed(previous_bboxes, prompt_bboxes)
+        recently_queued = last_request_at is not None and (now - last_request_at) < 0.2
+        if not stale and not changed:
+            return
+        if sam3_state == "segmenting" and not changed:
+            return
+        if recently_queued and not changed:
+            return
         request = Sam3Request(
             image=image.copy(),
             query=session.prompt,
@@ -1412,6 +1657,10 @@ class FalconPipelineRealtimeService:
         )
         with self.lock:
             self.latest_sam3_request = request
+            self.latest_sam3_prompt_bboxes = copy.deepcopy(prompt_bboxes)
+            self.latest_sam3_request_at = now
+            if self.latest_metrics.get("sam3_segmentation_state") == "segmenting":
+                self.latest_metrics["model_queue_wait_ms"] = 0.0
             if self.latest_metrics.get("sam3_segmentation_state") in {"disabled", "idle"}:
                 self.latest_metrics["sam3_segmentation_state"] = "queued"
 
@@ -1439,8 +1688,14 @@ class FalconPipelineRealtimeService:
 
             last_started_key = request_key
             try:
+                with self.lock:
+                    queue_wait_ms = None
+                    if self.latest_sam3_request_at is not None:
+                        queue_wait_ms = (time.time() - self.latest_sam3_request_at) * 1000.0
+                    self.latest_metrics["model_queue_wait_ms"] = None if queue_wait_ms is None else round(queue_wait_ms, 3)
                 self._set_metric("sam3_segmentation_state", "segmenting")
                 assert self.sam3_runtime is not None
+                generation_start = time.perf_counter()
                 sam3_inference = run_sam3_inference(
                     runtime=self.sam3_runtime,
                     image=request.image,
@@ -1449,6 +1704,7 @@ class FalconPipelineRealtimeService:
                     threshold=request.threshold,
                     mask_threshold=request.mask_threshold,
                 )
+                generation_ms = (time.perf_counter() - generation_start) * 1000.0
                 guidance = Sam3Guidance(
                     inference=sam3_inference,
                     ran_at=time.time(),
@@ -1461,6 +1717,9 @@ class FalconPipelineRealtimeService:
                     self.latest_metrics["sam3_segmentation_state"] = "ready"
                     self.latest_metrics["sam3_segmentation_age_seconds"] = 0.0
                     self.latest_metrics["sam3_segmentation_generation_seconds"] = sam3_inference.get("generation_seconds")
+                    self.latest_metrics["sam3_generation_ms"] = round(generation_ms, 3)
+                    self.sam3_timestamps.append(guidance.ran_at)
+                    self.latest_metrics["sam3_fps"] = fps_from_timestamps(self.sam3_timestamps)
             except Exception as exc:
                 with self.lock:
                     self.latest_sam3_error = str(exc)
@@ -1482,10 +1741,6 @@ class FalconPipelineRealtimeService:
                 sam3_error = self.latest_sam3_error
 
             if frame is None or not session.source_url.strip():
-                time.sleep(0.05)
-                continue
-
-            if self.falcon_runtime is None:
                 time.sleep(0.05)
                 continue
 
@@ -1517,6 +1772,8 @@ class FalconPipelineRealtimeService:
                 rtdetr_error = self.rtdetr_load_error
                 if self.rtdetr_runtime is not None:
                     try:
+                        self._set_metric("rtdetr_state", "running")
+                        rtdetr_start = time.perf_counter()
                         rtdetr_inference = run_rtdetr_inference(
                             runtime=self.rtdetr_runtime,
                             image=model_image,
@@ -1524,9 +1781,24 @@ class FalconPipelineRealtimeService:
                             falcon_bboxes=falcon_inference.get("bboxes") or [],
                             threshold=session.rtdetr_threshold,
                         )
+                        rtdetr_generation_ms = (time.perf_counter() - rtdetr_start) * 1000.0
                         rtdetr_error = None
+                        with self.lock:
+                            self.latest_rtdetr_inference = copy.deepcopy(rtdetr_inference)
+                            self.latest_rtdetr_error = None
+                            self.latest_rtdetr_frame_id = frame_id
+                            self.latest_rtdetr_at = time.time()
+                            self.rtdetr_timestamps.append(self.latest_rtdetr_at)
+                            self.latest_metrics["rtdetr_state"] = "ready"
+                            self.latest_metrics["rtdetr_age_seconds"] = 0.0
+                            self.latest_metrics["rtdetr_generation_seconds"] = rtdetr_inference.get("generation_seconds")
+                            self.latest_metrics["rtdetr_generation_ms"] = round(rtdetr_generation_ms, 3)
+                            self.latest_metrics["rtdetr_fps"] = fps_from_timestamps(self.rtdetr_timestamps)
                     except Exception as exc:
                         rtdetr_error = str(exc)
+                        with self.lock:
+                            self.latest_rtdetr_error = rtdetr_error
+                            self.latest_metrics["rtdetr_state"] = "error"
 
                 sam3_inference = None if sam3_guidance is None else sam3_guidance.inference
                 sam3_error = sam3_error or self.sam3_load_error
@@ -1580,26 +1852,104 @@ class FalconPipelineRealtimeService:
                 result["frame_generation_seconds"] = time.perf_counter() - frame_processing_start
                 result["generation_seconds"] = result["frame_generation_seconds"]
 
-                overlay_bgr = self._render_overlay(frame, result, session)
                 self.processed_timestamps.append(time.time())
-                fps = 0.0
-                if len(self.processed_timestamps) >= 2:
-                    elapsed = self.processed_timestamps[-1] - self.processed_timestamps[0]
-                    if elapsed > 0:
-                        fps = (len(self.processed_timestamps) - 1) / elapsed
-                self._set_metric("processed_fps", round(fps, 2))
+                self._set_metric("processed_fps", fps_from_timestamps(self.processed_timestamps))
                 self._set_metric("last_error", effective_falcon_error if falcon_guidance is None else None)
                 if falcon_guidance is not None:
                     self._set_metric("falcon_guidance_age_seconds", round(time.time() - falcon_guidance.ran_at, 3))
                 if sam3_guidance is not None:
                     self._set_metric("sam3_segmentation_age_seconds", round(time.time() - sam3_guidance.ran_at, 3))
-                self._set_latest_overlay(overlay_bgr, result)
+                self._set_latest_result(result)
                 last_processed_frame_id = frame_id
             except Exception as exc:
                 self._set_metric("pipeline_state", "error")
                 self._set_metric("last_error", f"Processing failed: {exc}")
                 self._set_placeholder_frame(f"Processing failed: {exc}")
                 time.sleep(0.25)
+
+    def _display_loop(self) -> None:
+        last_rendered_frame_id = -1
+        next_render_at = 0.0
+
+        while not self.stop_event.is_set():
+            with self.lock:
+                frame = None if self.latest_frame is None else self.latest_frame.copy()
+                frame_id = self.latest_frame_id
+                result = copy.deepcopy(self.latest_result)
+                metrics = copy.deepcopy(self.latest_metrics)
+                session = copy.deepcopy(self.session)
+
+            if frame is None or not session.source_url.strip():
+                time.sleep(0.03)
+                continue
+
+            if not result or not self._sam3_visual_ready(result, metrics):
+                time.sleep(0.03)
+                continue
+
+            target_fps = max(1.0, float(session.display_max_fps or 15.0))
+            now = time.time()
+            if now < next_render_at:
+                time.sleep(min(0.02, max(0.001, next_render_at - now)))
+                continue
+            if frame_id == last_rendered_frame_id:
+                time.sleep(0.005)
+                continue
+
+            try:
+                render_start = time.perf_counter()
+                overlay_bgr = self._render_overlay(frame, result, session)
+                overlay_render_ms = (time.perf_counter() - render_start) * 1000.0
+                encode_start = time.perf_counter()
+                payload = encode_jpeg(overlay_bgr, quality=session.jpeg_quality)
+                jpeg_encode_ms = (time.perf_counter() - encode_start) * 1000.0
+                result["frame_generation_seconds"] = (overlay_render_ms + jpeg_encode_ms) / 1000.0
+                self._publish_rendered_frame(
+                    payload,
+                    result,
+                    frame_id=frame_id,
+                    overlay_render_ms=overlay_render_ms,
+                    jpeg_encode_ms=jpeg_encode_ms,
+                )
+                last_rendered_frame_id = frame_id
+                next_render_at = time.time() + (1.0 / target_fps)
+            except Exception as exc:
+                self._set_metric("pipeline_state", "error")
+                self._set_metric("last_error", f"Display render failed: {exc}")
+                time.sleep(0.10)
+
+    def _gpu_monitor_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                completed = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=utilization.gpu,memory.used",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.5,
+                    check=False,
+                )
+                if completed.returncode != 0:
+                    message = (completed.stderr or completed.stdout or "nvidia-smi failed").strip()
+                    with self.lock:
+                        self.latest_metrics["gpu_telemetry_error"] = message[:240]
+                    time.sleep(2.0)
+                    continue
+                first_line = (completed.stdout or "").strip().splitlines()[0]
+                parts = [part.strip() for part in first_line.split(",")]
+                gpu_utilization = float(parts[0]) if parts and parts[0] else None
+                memory_used = float(parts[1]) if len(parts) > 1 and parts[1] else None
+                with self.lock:
+                    self.latest_metrics["gpu_utilization_percent"] = gpu_utilization
+                    self.latest_metrics["gpu_memory_used_mb"] = memory_used
+                    self.latest_metrics["gpu_telemetry_error"] = None
+            except Exception as exc:
+                with self.lock:
+                    self.latest_metrics["gpu_telemetry_error"] = str(exc)[:240]
+            time.sleep(2.0)
 
     def _render_overlay(
         self,
@@ -1823,8 +2173,9 @@ def create_app(service: FalconPipelineRealtimeService, ui_html: str):
         return HTMLResponse(ui_html)
 
     @app.get("/api/state")
-    async def state() -> JSONResponse:
-        return JSONResponse(service.get_state())
+    async def state(request: Request) -> JSONResponse:
+        debug = request.query_params.get("debug", "").lower() in {"1", "true", "yes", "full"}
+        return JSONResponse(service.get_state(debug=debug))
 
     @app.post("/api/session")
     async def update_session(request: Request) -> JSONResponse:
@@ -1912,6 +2263,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--falcon-max-dim", type=int, default=640, help="Longest side for Falcon refresh passes.")
     parser.add_argument("--falcon-max-new-tokens", type=int, default=128, help="Falcon max new tokens per refresh.")
     parser.add_argument("--falcon-refresh-seconds", type=float, default=5.0, help="Seconds between Falcon refreshes.")
+    parser.add_argument("--display-max-fps", type=float, default=15.0, help="Maximum cached JPEG overlay render rate.")
+    parser.add_argument("--sam3-refresh-seconds", type=float, default=1.0, help="Maximum SAM 3 mask age before refresh.")
     return parser.parse_args()
 
 
@@ -1962,6 +2315,8 @@ def main() -> int:
         falcon_max_dim=args.falcon_max_dim,
         falcon_max_new_tokens=args.falcon_max_new_tokens,
         falcon_refresh_seconds=args.falcon_refresh_seconds,
+        display_max_fps=args.display_max_fps,
+        sam3_refresh_seconds=args.sam3_refresh_seconds,
     )
 
     service = FalconPipelineRealtimeService(options, session)

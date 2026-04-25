@@ -777,3 +777,43 @@ Teardown:
 - follow-up `gcloud compute instances describe falcon-pipeline-l4 --project=tableminder --zone=us-east4-c` returned resource not found
 - follow-up `gcloud compute disks describe falcon-pipeline-l4 --project=tableminder --zone=us-east4-c` returned HTTP `404` resource not found
 - local port `8080` had no `LISTENING` tunnel left after teardown, only closed `TIME_WAIT` sockets and one browser retry
+
+## Current local hardening after the 10 FPS plan
+
+Implemented runtime structure:
+- capture remains independent and records `capture_fps`, `capture_latency_ms`, latest raw frame age, frame id, and timestamp
+- RT-DETR now updates perception state independently from browser frame delivery
+- Falcon remains a slow background guidance loop and does not run inside the frame response path
+- SAM3 requests are throttled by material prompt-box changes and `sam3_refresh_seconds`
+- the display loop renders the latest captured frame with the latest valid SAM3 result into a cached JPEG
+- `/api/frame.jpg` returns the cached JPEG and records frame response timing/FPS; it does not synchronously invoke RT-DETR, SAM3, or Falcon
+- readiness still requires healthy enabled engines and a visible SAM3 primary result; a live JPEG alone does not imply `full_pipeline_ready`
+
+Implemented diagnostics:
+- `/api/state` now exposes `capture_fps`, `display_frame_fps`, `frame_response_fps`, `rtdetr_fps`, `sam3_fps`, and `falcon_fps`
+- `/api/state` exposes freshness fields for raw frames, overlays, SAM3 masks, RT-DETR detections, and Falcon guidance
+- `/api/state` exposes timing fields for capture latency, RT-DETR generation, SAM3 generation, Falcon generation, overlay rendering, JPEG encoding, and frame response
+- `/api/state` exposes best-effort `gpu_utilization_percent` and `gpu_memory_used_mb` from `nvidia-smi`
+- GPU telemetry failure is recorded in `gpu_telemetry_error` and does not crash the service
+- default `/api/state` compacts mask and engine payloads; use `/api/state?debug=1` for full payload inspection
+
+Implemented operator measurement:
+- `scripts/gcp/measure_realtime_fps.py` measures observed `/api/frame.jpg` response FPS through the tunnel
+- the measurement output includes response latency, frame byte size, readiness summary, loop rates, render/encode timings, and GPU telemetry from `/api/state`
+
+Implemented launcher knobs:
+- `DISPLAY_MAX_FPS` defaults to `15.0`
+- `SAM3_REFRESH_SECONDS` defaults to `1.0`
+- existing model stack and endpoints are unchanged
+
+Validation performed locally:
+- targeted nonblocking frame endpoint tests passed
+- full local unit discovery passed with `46` tests
+- AST parse succeeded for the touched Python entrypoints after `py_compile` hit a Windows `__pycache__` permission issue
+
+Next VM acceptance should measure:
+- observed `/api/frame.jpg` response FPS with `scripts/gcp/measure_realtime_fps.py`
+- whether `display_frame_fps` reaches at least `10.0`
+- whether `frame_response_fps` can reach `15.0` to `30.0`
+- whether overlay rendering or JPEG encoding, not model inference, becomes the visible-frame bottleneck
+- whether GPU utilization rises during scheduled RT-DETR/SAM3/Falcon work without blocking frame delivery

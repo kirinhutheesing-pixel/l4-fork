@@ -25,6 +25,8 @@ The intended default runtime is:
 - SAM model id: `facebook/sam3` by default
 - `max_dim=960`
 - `falcon_refresh_seconds=5.0`
+- `display_max_fps=15.0` by default, tunable toward `30.0`
+- `sam3_refresh_seconds=1.0`
 
 ## SAM 3 realtime concept
 
@@ -33,8 +35,20 @@ The supported bring-up is now the SAM 3 segmentation view:
 - Falcon runs in a background guidance loop and refreshes slower natural-language context
 - SAM 3 is always loaded by the service and is not an operator toggle
 - when SAM 3 returns masks, `primary_engine` becomes `sam3` and `/api/frame.jpg` shows the SAM 3 mask overlay
-- while SAM 3 is first loading, the service can still show RT-DETR/Falcon-backed frames, but `/api/state` keeps `full_pipeline_ready=false` until SAM 3 is healthy and visibly primary
+- while SAM 3 is first loading or warming, `/api/frame.jpg` keeps placeholder/warming semantics; RT-DETR and Falcon remain helper engines, not visible detector-box output
 - after a visible SAM 3 result exists, the next `segmenting` cycle should not drop readiness on commit `60590b1` or newer
+
+## Multi-rate cached overlay concept
+
+The high-FPS path separates visual delivery from model inference:
+- capture loop reads frames continuously into shared state
+- RT-DETR loop refreshes prompt boxes independently from frame delivery
+- SAM 3 loop refreshes masks when boxes materially change or masks become stale
+- Falcon loop runs as slow semantic guidance and must not block RT-DETR, SAM 3, capture, or `/api/frame.jpg`
+- display loop renders the latest captured frame with the latest valid SAM 3 overlay into a cached JPEG
+- `/api/frame.jpg` returns the cached JPEG and records response timing; it does not synchronously run RT-DETR, SAM 3, or Falcon
+
+Use `/api/state?debug=1` only when full engine payloads are needed. Default `/api/state` keeps masks and engine outputs compact so state polling does not compete with frame delivery.
 
 SAM 3.1 note: `facebook/sam3.1` is a gated checkpoint repo, but the official Hugging Face model card says it has no Transformers integration. The current service uses the Transformers `Sam3Model` / `Sam3Processor` path, so `facebook/sam3` remains the default. Use `SAM3_MODEL_ID=facebook/sam3.1` only as an explicit compatibility probe until the service has a native `facebookresearch/sam3` package integration.
 
@@ -269,6 +283,8 @@ Optional runtime environment toggles:
 - `FALCON_REFRESH_SECONDS`: defaults to `5.0`
 - `FALCON_MIN_DIM`, `FALCON_MAX_DIM`, `FALCON_MAX_NEW_TOKENS`
 - `MIN_DIM`, `MAX_DIM`
+- `DISPLAY_MAX_FPS`: defaults to `15.0`
+- `SAM3_REFRESH_SECONDS`: defaults to `1.0`
 
 Keep `SAM3_MODEL_ID=facebook/sam3` for supported runs. `facebook/sam3.1` is not yet a supported runtime path in this service.
 
@@ -367,6 +383,22 @@ Watch these fields:
 - `metrics.capture_state`
 - `metrics.pipeline_state`
 - `metrics.last_error`
+- `metrics.capture_fps`
+- `metrics.display_frame_fps`
+- `metrics.frame_response_fps`
+- `metrics.rtdetr_fps`
+- `metrics.sam3_fps`
+- `metrics.falcon_fps`
+- `metrics.latest_raw_frame_age_seconds`
+- `metrics.latest_overlay_age_seconds`
+- `metrics.latest_sam3_mask_age_seconds`
+- `metrics.latest_rtdetr_age_seconds`
+- `metrics.latest_falcon_guidance_age_seconds`
+- `metrics.overlay_render_ms`
+- `metrics.jpeg_encode_ms`
+- `metrics.frame_response_ms`
+- `metrics.gpu_utilization_percent`
+- `metrics.gpu_memory_used_mb`
 
 Expected progression:
 
@@ -444,6 +476,16 @@ curl -s http://127.0.0.1:8080/api/frame.jpg --output frame-2.jpg
 ```
 
 When the service is live, the files should change over time and `/api/state` should report `frame.ready = true`.
+
+### FPS measurement
+
+After tunneling, measure browser-visible frame delivery:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\gcp\measure_realtime_fps.py --base-url http://127.0.0.1:8080 --seconds 5
+```
+
+The output reports observed `/api/frame.jpg` response FPS, response latency, overlay render time, JPEG encode time, RT-DETR/SAM3/Falcon loop rates, and best-effort GPU utilization/memory from `/api/state`.
 
 ### Browser overlay
 
@@ -533,10 +575,10 @@ If `/api/frame.jpg` stays placeholder:
 - confirm `model_status.rt_detr.state = "loaded"`
 
 If latency is far below 10 FPS:
-- inspect `metrics.processed_fps`, `metrics.falcon_guidance_generation_seconds`, `metrics.sam3_segmentation_generation_seconds`, and `result.frame_generation_seconds`
+- inspect `metrics.display_frame_fps`, `metrics.frame_response_fps`, `metrics.capture_fps`, `metrics.rtdetr_fps`, `metrics.sam3_fps`, `metrics.falcon_fps`, `metrics.overlay_render_ms`, `metrics.jpeg_encode_ms`, and GPU telemetry
 - do not assume the L4 is too weak until GPU utilization and per-stage timings prove it
 - the April 24 source-switch run showed about `0.42` to `0.50` processed FPS, Falcon guidance around `4.2` to `8.0` seconds, SAM3 segmentation around `0.50` to `0.90` seconds, and bursty GPU use
-- the next hardening target is to decouple display FPS from heavy model inference, not to buy a larger GPU first
+- current hardening decouples display FPS from heavy model inference; if the VM still misses 10 FPS, use the measurement script output to decide whether overlay rendering, JPEG encoding, source capture, or model scheduling is the next bottleneck
 
 If the frame is live but everyone is `unclassified`:
 - inspect `result.scene_annotations.counts`

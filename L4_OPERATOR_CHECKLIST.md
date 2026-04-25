@@ -101,6 +101,8 @@ Current required runtime:
 Useful optional launcher env vars:
 - `SAM3_MODEL_ID=facebook/sam3`
 - `FALCON_REFRESH_SECONDS=5.0`
+- `DISPLAY_MAX_FPS=15.0`
+- `SAM3_REFRESH_SECONDS=1.0`
 
 Confirm `/api/state` before judging the screen:
 - `result.primary_engine = "sam3"`
@@ -222,12 +224,25 @@ If everyone is `unclassified` in `scene_annotations`:
 - that is a prompt/heuristic limitation, not a VM health failure
 
 If latency is the blocker:
-- collect `metrics.processed_fps`
+- collect `metrics.display_frame_fps`
+- collect `metrics.frame_response_fps`
+- collect `metrics.capture_fps`
+- collect `metrics.rtdetr_fps`
+- collect `metrics.sam3_fps`
+- collect `metrics.falcon_fps`
+- collect `metrics.overlay_render_ms`
+- collect `metrics.jpeg_encode_ms`
 - collect `metrics.falcon_guidance_generation_seconds`
 - collect `metrics.sam3_segmentation_generation_seconds`
 - collect `result.frame_generation_seconds`
 - check GPU utilization before assuming the GPU is undersized
 - the April 24 source-switch run was around `0.42` to `0.50` processed FPS even though GPU use was bursty, so the next fix is pipeline scheduling and cached overlay rendering
+
+Frame delivery measurement:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\gcp\measure_realtime_fps.py --base-url http://127.0.0.1:8080 --seconds 5
+```
 
 ## 8. Delete the VM
 

@@ -15,6 +15,8 @@ class GcpScriptContractTests(unittest.TestCase):
         self.assertIn("--preflight-only", script)
         self.assertIn("--sam-preflight-only", script)
         self.assertIn('--sam3-model-id "${SAM3_MODEL_ID}"', script)
+        self.assertIn('--display-max-fps "${DISPLAY_MAX_FPS}"', script)
+        self.assertIn('--sam3-refresh-seconds "${SAM3_REFRESH_SECONDS}"', script)
         self.assertIn('if [[ -n "${YTDLP_COOKIES_FILE:-}" ]]', script)
         self.assertIn("--yt-cookies-file", script)
 

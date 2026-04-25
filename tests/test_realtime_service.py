@@ -31,6 +31,7 @@ from falcon_pipeline_realtime_service import (
     SAM_PREFLIGHT_STATUS_READY,
     SAM_PREFLIGHT_STATUS_UNSUPPORTED,
     Sam3Guidance,
+    Sam3Request,
     SOURCE_STATUS_AUTH_REQUIRED,
     SOURCE_STATUS_IDLE,
     SOURCE_STATUS_READY,
@@ -82,6 +83,37 @@ class RealtimeServiceTests(unittest.TestCase):
             service.sam3_runtime = {"model": object()}
             service._set_model_state("sam3", "loaded")
 
+    def seed_cached_sam3_overlay(self, service: FalconPipelineRealtimeService) -> None:
+        service._set_metric("capture_state", "running")
+        service._set_metric("pipeline_state", "running")
+        service._set_metric("sam3_segmentation_state", "ready")
+        service._set_latest_overlay(
+            np.zeros((32, 32, 3), dtype=np.uint8),
+            {
+                "primary_engine": "sam3",
+                "generation_seconds": 0.05,
+                "detections": [
+                    {
+                        "index": 0,
+                        "center": {"x": 0.5, "y": 0.5},
+                        "height": 0.2,
+                        "width": 0.1,
+                        "has_mask": True,
+                        "engine": "sam3",
+                        "label": "person",
+                    }
+                ],
+                "bboxes": [{"x": 0.5, "y": 0.5, "w": 0.1, "h": 0.2}],
+                "masks_rle": [{"counts": "mock", "size": [32, 32]}],
+                "num_masks": 1,
+                "engines": [
+                    {"name": "falcon", "enabled": True, "status": "ok", "reason": None},
+                    {"name": "rt_detr", "enabled": True, "status": "ok", "reason": None},
+                    {"name": "sam3", "enabled": True, "status": "ok", "reason": None, "num_masks": 1},
+                ],
+            },
+        )
+
     def test_parse_args_defaults_use_l4_profile(self) -> None:
         with mock.patch.object(sys, "argv", ["falcon_pipeline_realtime_service.py"]):
             args = parse_args()
@@ -94,6 +126,8 @@ class RealtimeServiceTests(unittest.TestCase):
         self.assertFalse(args.no_load_rtdetr)
         self.assertEqual(args.max_dim, 960)
         self.assertEqual(args.falcon_refresh_seconds, 5.0)
+        self.assertEqual(args.display_max_fps, 15.0)
+        self.assertEqual(args.sam3_refresh_seconds, 1.0)
 
     def test_load_models_without_source_reports_idle_ready_state(self) -> None:
         service = self.make_service(source_url="", load_rtdetr=True)
@@ -272,6 +306,204 @@ class RealtimeServiceTests(unittest.TestCase):
         self.assertEqual(state["readiness"]["service_state"], "live")
         self.assertTrue(state["readiness"]["full_pipeline_ready"])
         self.assertTrue(state["readiness"]["sam3_visual_ready"])
+
+    def test_frame_endpoint_does_not_block_on_running_sam3_pass(self) -> None:
+        service = self.make_service(source_url="https://www.youtube.com/watch?v=example", load_rtdetr=True, load_sam3=True)
+        self.mark_models_loaded(service)
+        self.seed_cached_sam3_overlay(service)
+        service.latest_sam3_request = Sam3Request(
+            image=Image.new("RGB", (32, 32)),
+            query=service.session.prompt,
+            prompt_bboxes=[{"x": 0.5, "y": 0.5, "w": 0.1, "h": 0.2}],
+            threshold=service.session.sam3_threshold,
+            mask_threshold=service.session.sam3_mask_threshold,
+            frame_id=1,
+            prompt_revision=service.prompt_revision,
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_sam3(**_kwargs):
+            entered.set()
+            release.wait(timeout=0.4)
+            return {
+                "engine": "sam3",
+                "model_id": "facebook/sam3",
+                "device": "cuda",
+                "detections": [],
+                "bboxes": [],
+                "masks_rle": [],
+                "num_masks": 0,
+                "generation_seconds": 0.4,
+            }
+
+        with mock.patch("falcon_pipeline_realtime_service.run_sam3_inference", side_effect=slow_sam3):
+            thread = threading.Thread(target=service._sam3_loop, daemon=True)
+            thread.start()
+            self.assertTrue(entered.wait(timeout=1.0))
+            client = TestClient(create_app(service, "<html></html>"))
+            start = time.perf_counter()
+            response = client.get("/api/frame.jpg")
+            elapsed = time.perf_counter() - start
+            release.set()
+            service.shutdown()
+            thread.join(timeout=1.0)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertLess(elapsed, 0.1)
+
+    def test_frame_endpoint_does_not_block_on_running_falcon_pass(self) -> None:
+        class SlowFalconRuntime:
+            def __init__(self, entered: threading.Event, release: threading.Event) -> None:
+                self.entered = entered
+                self.release = release
+
+            def run(self, **_kwargs):
+                self.entered.set()
+                self.release.wait(timeout=0.4)
+                return {
+                    "decoded_output": "person",
+                    "detections": [],
+                    "bboxes": [],
+                    "masks_rle": [],
+                    "num_masks": 0,
+                    "generation_seconds": 0.4,
+                }
+
+        service = self.make_service(source_url="https://www.youtube.com/watch?v=example", load_rtdetr=True, load_sam3=True)
+        self.mark_models_loaded(service)
+        self.seed_cached_sam3_overlay(service)
+        service.latest_frame = np.zeros((64, 64, 3), dtype=np.uint8)
+        service.latest_frame_id = 11
+        entered = threading.Event()
+        release = threading.Event()
+        service.falcon_runtime = SlowFalconRuntime(entered, release)
+
+        thread = threading.Thread(target=service._falcon_guidance_loop, daemon=True)
+        thread.start()
+        self.assertTrue(entered.wait(timeout=1.0))
+        client = TestClient(create_app(service, "<html></html>"))
+        start = time.perf_counter()
+        response = client.get("/api/frame.jpg")
+        elapsed = time.perf_counter() - start
+        release.set()
+        service.shutdown()
+        thread.join(timeout=1.0)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertLess(elapsed, 0.1)
+
+    def test_display_loop_keeps_cached_sam3_visible_while_segmenting(self) -> None:
+        service = self.make_service(source_url="https://www.youtube.com/watch?v=example", load_rtdetr=True, load_sam3=True)
+        self.mark_models_loaded(service)
+        service.session.display_max_fps = 30.0
+        service.latest_frame = np.zeros((64, 64, 3), dtype=np.uint8)
+        service.latest_frame_id = 3
+        service._set_metric("capture_state", "running")
+        service._set_metric("pipeline_state", "running")
+        service._set_metric("sam3_segmentation_state", "segmenting")
+        service.latest_result = {
+            "primary_engine": "sam3",
+            "generation_seconds": 0.05,
+            "detections": [
+                {
+                    "index": 0,
+                    "center": {"x": 0.5, "y": 0.5},
+                    "height": 0.2,
+                    "width": 0.1,
+                    "has_mask": True,
+                    "engine": "sam3",
+                    "label": "person",
+                }
+            ],
+            "bboxes": [{"x": 0.5, "y": 0.5, "w": 0.1, "h": 0.2}],
+            "masks_rle": [],
+            "num_masks": 1,
+            "engines": [
+                {"name": "falcon", "enabled": True, "status": "ok", "reason": None},
+                {"name": "rt_detr", "enabled": True, "status": "ok", "reason": None},
+                {"name": "sam3", "enabled": True, "status": "ok", "reason": None, "num_masks": 1},
+            ],
+        }
+        with mock.patch("falcon_pipeline_realtime_service.render_visualization") as render:
+            render.return_value = Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8))
+            thread = threading.Thread(target=service._display_loop, daemon=True)
+            thread.start()
+            self.assertTrue(self.wait_until(lambda: service.get_state()["frame"]["ready"]))
+            service.shutdown()
+            thread.join(timeout=1.0)
+
+        state = service.get_state()
+        self.assertEqual(state["result"]["primary_engine"], "sam3")
+        self.assertTrue(state["readiness"]["sam3_visual_ready"])
+        self.assertTrue(state["readiness"]["full_pipeline_ready"])
+
+    def test_live_frame_alone_does_not_imply_full_pipeline_ready(self) -> None:
+        service = self.make_service(source_url="https://www.youtube.com/watch?v=example", load_rtdetr=True, load_sam3=True)
+        self.mark_models_loaded(service)
+        service._set_metric("capture_state", "running")
+        service._set_latest_overlay(
+            np.zeros((32, 32, 3), dtype=np.uint8),
+            {"primary_engine": "rt_detr", "detections": [], "bboxes": [], "masks_rle": [], "num_masks": 0},
+        )
+
+        state = service.get_state()
+        self.assertTrue(state["frame"]["ready"])
+        self.assertFalse(state["readiness"]["full_pipeline_ready"])
+        self.assertFalse(state["readiness"]["sam3_visual_ready"])
+
+    def test_state_metrics_are_compact_and_include_runtime_diagnostics(self) -> None:
+        service = self.make_service(source_url="https://www.youtube.com/watch?v=example", load_rtdetr=True, load_sam3=True)
+        self.mark_models_loaded(service)
+        self.seed_cached_sam3_overlay(service)
+        with service.lock:
+            service.latest_metrics["gpu_utilization_percent"] = 42.0
+            service.latest_metrics["gpu_memory_used_mb"] = 5315.0
+            service.latest_result["engine_outputs"] = {
+                "sam3": {
+                    "engine": "sam3",
+                    "model_id": "facebook/sam3",
+                    "device": "cuda",
+                    "detections": [{"label": "person"}],
+                    "bboxes": [{"x": 0.5, "y": 0.5, "w": 0.1, "h": 0.2}],
+                    "masks_rle": [{"counts": "large-payload", "size": [32, 32]}],
+                    "num_masks": 1,
+                    "generation_seconds": 0.5,
+                }
+            }
+
+        state = service.get_state()
+        metrics = state["metrics"]
+        for key in (
+            "capture_fps",
+            "display_frame_fps",
+            "frame_response_fps",
+            "rtdetr_fps",
+            "sam3_fps",
+            "falcon_fps",
+            "latest_raw_frame_age_seconds",
+            "latest_overlay_age_seconds",
+            "latest_sam3_mask_age_seconds",
+            "latest_rtdetr_age_seconds",
+            "latest_falcon_guidance_age_seconds",
+            "capture_latency_ms",
+            "rtdetr_generation_ms",
+            "sam3_generation_ms",
+            "falcon_generation_ms",
+            "overlay_render_ms",
+            "jpeg_encode_ms",
+            "frame_response_ms",
+            "gpu_utilization_percent",
+            "gpu_memory_used_mb",
+        ):
+            self.assertIn(key, metrics)
+        self.assertNotIn("masks_rle", state["result"])
+        self.assertEqual(state["result"]["masks_rle_count"], 1)
+        self.assertEqual(state["result"]["engine_outputs"]["sam3"]["masks_rle_count"], 1)
+        self.assertNotIn("masks_rle", state["result"]["engine_outputs"]["sam3"])
+        debug_state = service.get_state(debug=True)
+        self.assertIn("masks_rle", debug_state["result"])
+        self.assertIn("masks_rle", debug_state["result"]["engine_outputs"]["sam3"])
 
     def test_render_overlay_never_sends_detection_boxes_to_visualizer(self) -> None:
         service = self.make_service(source_url="https://www.youtube.com/watch?v=example")
