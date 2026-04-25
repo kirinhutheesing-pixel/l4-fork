@@ -93,6 +93,16 @@ RESTAURANT_ROLE_COLORS = {
     "unclassified": (168, 184, 196),
     "needs_service": (54, 54, 235),
 }
+SAM3_MASK_COLORS = (
+    (54, 54, 235),
+    (36, 201, 138),
+    (71, 144, 255),
+    (88, 197, 255),
+    (219, 179, 74),
+    (184, 104, 219),
+    (42, 199, 219),
+    (168, 184, 196),
+)
 
 SOURCE_STATUS_IDLE = "idle"
 SOURCE_STATUS_RESOLVING = "resolving"
@@ -891,8 +901,10 @@ class FalconPipelineRealtimeService:
         self.latest_sam3_prompt_bboxes: list[dict[str, float]] | None = None
         self.latest_sam3_request_at: float | None = None
         self.latest_result: dict[str, Any] = {}
+        self.latest_result_version = 0
         self.latest_result_at: float | None = None
         self.latest_jpeg: bytes = b""
+        self.latest_jpeg_at: float | None = None
         self.latest_overlay_at: float | None = None
         self.latest_overlay_frame_id: int | None = None
         self.latest_frame_is_placeholder = True
@@ -929,8 +941,16 @@ class FalconPipelineRealtimeService:
             "latest_falcon_guidance_age_seconds": None,
             "capture_latency_ms": None,
             "overlay_render_ms": None,
+            "overlay_snapshot_lock_ms": None,
+            "mask_prepare_ms": None,
+            "mask_rasterize_ms": None,
+            "frame_composite_ms": None,
+            "annotation_draw_ms": None,
+            "overlay_total_ms": None,
+            "cached_jpeg_age_seconds": None,
             "jpeg_encode_ms": None,
             "frame_response_ms": None,
+            "request_handler_ms": None,
             "gpu_utilization_percent": None,
             "gpu_memory_used_mb": None,
             "gpu_telemetry_error": None,
@@ -1025,12 +1045,14 @@ class FalconPipelineRealtimeService:
         payload = placeholder_frame(message)
         with self.lock:
             self.latest_jpeg = payload
+            self.latest_jpeg_at = time.time()
             self.latest_frame_is_placeholder = True
             self.latest_frame_note = message
             self.latest_overlay_at = None
             self.latest_overlay_frame_id = None
             if clear_result:
                 self.latest_result = {}
+                self.latest_result_version += 1
                 self.latest_result_at = None
 
     def _mark_live_frame(self) -> None:
@@ -1257,6 +1279,7 @@ class FalconPipelineRealtimeService:
                 self.latest_frame = None
                 self.latest_raw_frame_at = None
                 self.latest_result = {}
+                self.latest_result_version += 1
                 self.latest_result_at = None
                 self.latest_overlay_at = None
                 self.latest_overlay_frame_id = None
@@ -1270,6 +1293,15 @@ class FalconPipelineRealtimeService:
                 self.latest_metrics["frame_response_fps"] = 0.0
                 self.latest_metrics["latest_raw_frame_age_seconds"] = None
                 self.latest_metrics["latest_overlay_age_seconds"] = None
+                self.latest_metrics["cached_jpeg_age_seconds"] = None
+                self.latest_metrics["overlay_snapshot_lock_ms"] = None
+                self.latest_metrics["mask_prepare_ms"] = None
+                self.latest_metrics["mask_rasterize_ms"] = None
+                self.latest_metrics["frame_composite_ms"] = None
+                self.latest_metrics["annotation_draw_ms"] = None
+                self.latest_metrics["overlay_total_ms"] = None
+                self.latest_metrics["jpeg_encode_ms"] = None
+                self.latest_metrics["request_handler_ms"] = None
                 self.latest_frame_is_placeholder = True
                 self.latest_frame_note = "Switching stream source."
                 self.capture_timestamps.clear()
@@ -1317,6 +1349,7 @@ class FalconPipelineRealtimeService:
             metrics["falcon_fps"] = fps_from_timestamps(self.falcon_timestamps)
             metrics["latest_raw_frame_age_seconds"] = age_seconds(self.latest_raw_frame_at, now)
             metrics["latest_overlay_age_seconds"] = age_seconds(self.latest_overlay_at, now)
+            metrics["cached_jpeg_age_seconds"] = age_seconds(self.latest_jpeg_at, now)
             metrics["latest_sam3_mask_age_seconds"] = age_seconds(
                 None if self.latest_sam3_guidance is None else self.latest_sam3_guidance.ran_at,
                 now,
@@ -1393,6 +1426,7 @@ class FalconPipelineRealtimeService:
     def _set_latest_result(self, result: dict[str, Any]) -> None:
         with self.lock:
             self.latest_result = copy.deepcopy(result)
+            self.latest_result_version += 1
             self.latest_result_at = time.time()
             self.latest_metrics["pipeline_state"] = "running"
             self.latest_metrics["latest_generation_seconds"] = result.get("generation_seconds")
@@ -1410,6 +1444,7 @@ class FalconPipelineRealtimeService:
         publish_time = time.time()
         with self.lock:
             self.latest_jpeg = payload
+            self.latest_jpeg_at = publish_time
             self.latest_result = copy.deepcopy(result)
             self.latest_result_at = publish_time
             self.latest_overlay_at = publish_time
@@ -1421,6 +1456,33 @@ class FalconPipelineRealtimeService:
             self.latest_metrics["last_processed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
             self.latest_metrics["overlay_render_ms"] = None if overlay_render_ms is None else round(overlay_render_ms, 3)
             self.latest_metrics["jpeg_encode_ms"] = None if jpeg_encode_ms is None else round(jpeg_encode_ms, 3)
+            self.display_timestamps.append(publish_time)
+            self.latest_metrics["display_frame_fps"] = fps_from_timestamps(self.display_timestamps)
+
+    def _publish_display_frame(
+        self,
+        payload: bytes,
+        *,
+        frame_id: int | None,
+        overlay_render_ms: float,
+        jpeg_encode_ms: float,
+        timing: dict[str, float],
+    ) -> None:
+        publish_time = time.time()
+        with self.lock:
+            self.latest_jpeg = payload
+            self.latest_jpeg_at = publish_time
+            self.latest_overlay_at = publish_time
+            self.latest_overlay_frame_id = frame_id
+            self.latest_frame_is_placeholder = False
+            self.latest_frame_note = None
+            self.latest_metrics["pipeline_state"] = "running"
+            self.latest_metrics["last_processed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            self.latest_metrics["overlay_render_ms"] = round(overlay_render_ms, 3)
+            self.latest_metrics["overlay_total_ms"] = round(overlay_render_ms, 3)
+            self.latest_metrics["jpeg_encode_ms"] = round(jpeg_encode_ms, 3)
+            for key, value in timing.items():
+                self.latest_metrics[key] = round(value, 3)
             self.display_timestamps.append(publish_time)
             self.latest_metrics["display_frame_fps"] = fps_from_timestamps(self.display_timestamps)
 
@@ -1444,7 +1506,9 @@ class FalconPipelineRealtimeService:
             now = time.time()
             self.frame_response_timestamps.append(now)
             self.latest_metrics["frame_response_fps"] = fps_from_timestamps(self.frame_response_timestamps)
-            self.latest_metrics["frame_response_ms"] = round((time.perf_counter() - start) * 1000.0, 3)
+            request_handler_ms = round((time.perf_counter() - start) * 1000.0, 3)
+            self.latest_metrics["frame_response_ms"] = request_handler_ms
+            self.latest_metrics["request_handler_ms"] = request_handler_ms
             return payload
 
     def _open_capture(
@@ -1870,16 +1934,21 @@ class FalconPipelineRealtimeService:
     def _display_loop(self) -> None:
         last_rendered_frame_id = -1
         next_render_at = 0.0
+        cached_layer_key: tuple[int, int, int] | None = None
+        cached_layer: dict[str, Any] | None = None
 
         while not self.stop_event.is_set():
+            snapshot_start = time.perf_counter()
             with self.lock:
-                frame = None if self.latest_frame is None else self.latest_frame.copy()
+                frame_ref = self.latest_frame
                 frame_id = self.latest_frame_id
-                result = copy.deepcopy(self.latest_result)
-                metrics = copy.deepcopy(self.latest_metrics)
-                session = copy.deepcopy(self.session)
+                result = self.latest_result
+                result_version = self.latest_result_version
+                metrics = dict(self.latest_metrics)
+                session = copy.copy(self.session)
+            snapshot_lock_ms = (time.perf_counter() - snapshot_start) * 1000.0
 
-            if frame is None or not session.source_url.strip():
+            if frame_ref is None or not session.source_url.strip():
                 time.sleep(0.03)
                 continue
 
@@ -1897,19 +1966,47 @@ class FalconPipelineRealtimeService:
                 continue
 
             try:
+                frame = frame_ref.copy()
+                layer_key = (result_version, frame.shape[0], frame.shape[1])
+                if cached_layer_key != layer_key:
+                    cached_layer, layer_timing = self._prepare_mask_overlay_layer(result, frame.shape)
+                    cached_layer_key = layer_key
+                    mask_prepare_ms = layer_timing["mask_prepare_ms"]
+                    mask_rasterize_ms = layer_timing["mask_rasterize_ms"]
+                else:
+                    mask_prepare_ms = 0.0
+                    mask_rasterize_ms = 0.0
+
                 render_start = time.perf_counter()
-                overlay_bgr = self._render_overlay(frame, result, session)
-                overlay_render_ms = (time.perf_counter() - render_start) * 1000.0
+                composite_start = time.perf_counter()
+                overlay_bgr = self._composite_mask_overlay(frame, cached_layer)
+                frame_composite_ms = (time.perf_counter() - composite_start) * 1000.0
+
+                annotation_start = time.perf_counter()
+                self._draw_overlay_annotations(
+                    overlay_bgr,
+                    result,
+                    session,
+                    set() if cached_layer is None else cached_layer.get("matched_entity_indexes", set()),
+                )
+                annotation_draw_ms = (time.perf_counter() - annotation_start) * 1000.0
+                composite_annotation_ms = (time.perf_counter() - render_start) * 1000.0
+                overlay_render_ms = mask_prepare_ms + mask_rasterize_ms + composite_annotation_ms
                 encode_start = time.perf_counter()
                 payload = encode_jpeg(overlay_bgr, quality=session.jpeg_quality)
                 jpeg_encode_ms = (time.perf_counter() - encode_start) * 1000.0
-                result["frame_generation_seconds"] = (overlay_render_ms + jpeg_encode_ms) / 1000.0
-                self._publish_rendered_frame(
+                self._publish_display_frame(
                     payload,
-                    result,
                     frame_id=frame_id,
                     overlay_render_ms=overlay_render_ms,
                     jpeg_encode_ms=jpeg_encode_ms,
+                    timing={
+                        "overlay_snapshot_lock_ms": snapshot_lock_ms,
+                        "mask_prepare_ms": mask_prepare_ms,
+                        "mask_rasterize_ms": mask_rasterize_ms,
+                        "frame_composite_ms": frame_composite_ms,
+                        "annotation_draw_ms": annotation_draw_ms,
+                    },
                 )
                 last_rendered_frame_id = frame_id
                 next_render_at = time.time() + (1.0 / target_fps)
@@ -1951,37 +2048,107 @@ class FalconPipelineRealtimeService:
                     self.latest_metrics["gpu_telemetry_error"] = str(exc)[:240]
             time.sleep(2.0)
 
-    def _render_overlay(
+    def _prepare_mask_overlay_layer(
         self,
-        frame_bgr: np.ndarray,
         inference: dict[str, Any],
-        session: LiveSessionConfig,
-    ) -> np.ndarray:
+        frame_shape: tuple[int, ...],
+    ) -> tuple[dict[str, Any], dict[str, float]]:
+        height, width = int(frame_shape[0]), int(frame_shape[1])
         scene_annotations = inference.get("scene_annotations") or {}
         entities = scene_annotations.get("entities") or []
         detections = inference.get("detections") or []
         masks_rle = inference.get("masks_rle") or []
-        overlay_pil = render_visualization(
-            Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)),
-            [],
-            [] if entities else masks_rle,
-            interior_opacity=0.22,
-            border_thickness=2,
-        )
-        overlay_bgr = cv2.cvtColor(np.array(overlay_pil), cv2.COLOR_RGB2BGR)
-        height, width = overlay_bgr.shape[:2]
-        matched_entity_indexes: set[int] = set()
-        if entities:
-            matched_entity_indexes = apply_entity_role_masks(
-                overlay_bgr,
-                entities=entities,
-                detections=detections,
-                masks_rle=masks_rle,
-            )
 
-        header = overlay_bgr.copy()
-        cv2.rectangle(header, (0, 0), (width, 124), (20, 47, 48), -1)
-        overlay_bgr = cv2.addWeighted(header, 0.42, overlay_bgr, 0.58, 0.0)
+        prepare_start = time.perf_counter()
+        mask_matches: dict[int, int] = {}
+        if entities:
+            mask_matches = match_entity_masks(entities, detections, len(masks_rle))
+        else:
+            mask_matches = {mask_index: mask_index for mask_index in range(len(masks_rle))}
+        mask_prepare_ms = (time.perf_counter() - prepare_start) * 1000.0
+
+        color_layer = np.zeros((height, width, 3), dtype=np.uint8)
+        alpha_layer = np.zeros((height, width), dtype=np.uint8)
+        matched_entity_indexes: set[int] = set()
+        rasterize_start = time.perf_counter()
+        for entity_or_mask_index, mask_index in mask_matches.items():
+            if mask_index < 0 or mask_index >= len(masks_rle):
+                continue
+            mask = decode_rle_mask(masks_rle[mask_index])
+            if mask is None:
+                continue
+            if mask.ndim == 3:
+                mask = mask[..., 0]
+            if mask.shape != (height, width):
+                mask = cv2.resize(mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST)
+
+            region = mask > 0
+            if not np.any(region):
+                continue
+
+            if entities:
+                color = entity_color_bgr(entities[entity_or_mask_index])
+                matched_entity_indexes.add(entity_or_mask_index)
+            else:
+                color = SAM3_MASK_COLORS[mask_index % len(SAM3_MASK_COLORS)]
+
+            color_layer[region] = color
+            alpha_layer[region] = np.maximum(alpha_layer[region], 92)
+
+            contours, _ = cv2.findContours(region.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                cv2.drawContours(color_layer, contours, -1, color, 2, cv2.LINE_AA)
+                cv2.drawContours(alpha_layer, contours, -1, 255, 2, cv2.LINE_AA)
+
+        mask_rasterize_ms = (time.perf_counter() - rasterize_start) * 1000.0
+        return {
+            "color_bgr": color_layer,
+            "alpha": alpha_layer,
+            "matched_entity_indexes": matched_entity_indexes,
+        }, {
+            "mask_prepare_ms": mask_prepare_ms,
+            "mask_rasterize_ms": mask_rasterize_ms,
+        }
+
+    def _composite_mask_overlay(
+        self,
+        frame_bgr: np.ndarray,
+        cached_layer: dict[str, Any] | None,
+    ) -> np.ndarray:
+        overlay_bgr = frame_bgr.copy()
+        if not cached_layer:
+            return overlay_bgr
+        alpha_layer = cached_layer.get("alpha")
+        color_layer = cached_layer.get("color_bgr")
+        if alpha_layer is None or color_layer is None:
+            return overlay_bgr
+
+        region = alpha_layer > 0
+        if not np.any(region):
+            return overlay_bgr
+
+        alpha = (alpha_layer[region].astype(np.float32) / 255.0)[:, None]
+        base_pixels = overlay_bgr[region].astype(np.float32)
+        color_pixels = color_layer[region].astype(np.float32)
+        overlay_bgr[region] = (base_pixels * (1.0 - alpha) + color_pixels * alpha).clip(0, 255).astype(np.uint8)
+        return overlay_bgr
+
+    def _draw_overlay_annotations(
+        self,
+        overlay_bgr: np.ndarray,
+        inference: dict[str, Any],
+        session: LiveSessionConfig,
+        matched_entity_indexes: set[int],
+    ) -> None:
+        scene_annotations = inference.get("scene_annotations") or {}
+        entities = scene_annotations.get("entities") or []
+        detections = inference.get("detections") or []
+        height, width = overlay_bgr.shape[:2]
+
+        header_height = min(124, height)
+        header_roi = overlay_bgr[:header_height, :]
+        header_color = np.full_like(header_roi, (20, 47, 48), dtype=np.uint8)
+        cv2.addWeighted(header_color, 0.42, header_roi, 0.58, 0.0, dst=header_roi)
 
         primary_engine = str(inference.get("primary_engine") or "falcon").replace("_", "-").upper()
         latency = inference.get("generation_seconds")
@@ -2029,6 +2196,20 @@ class FalconPipelineRealtimeService:
                 continue
             draw_entity_color_marker(overlay_bgr, entity, width=width, height=height)
 
+    def _render_overlay(
+        self,
+        frame_bgr: np.ndarray,
+        inference: dict[str, Any],
+        session: LiveSessionConfig,
+    ) -> np.ndarray:
+        cached_layer, _timing = self._prepare_mask_overlay_layer(inference, frame_bgr.shape)
+        overlay_bgr = self._composite_mask_overlay(frame_bgr, cached_layer)
+        self._draw_overlay_annotations(
+            overlay_bgr,
+            inference,
+            session,
+            cached_layer.get("matched_entity_indexes", set()),
+        )
         return overlay_bgr
 
     def mjpeg_stream(self):

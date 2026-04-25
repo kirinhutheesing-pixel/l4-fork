@@ -393,6 +393,88 @@ class RealtimeServiceTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertLess(elapsed, 0.1)
 
+    def test_frame_endpoint_returns_cached_jpeg_without_rasterizing_masks(self) -> None:
+        service = self.make_service(source_url="https://www.youtube.com/watch?v=example", load_rtdetr=True, load_sam3=True)
+        self.mark_models_loaded(service)
+        self.seed_cached_sam3_overlay(service)
+        client = TestClient(create_app(service, "<html></html>"))
+
+        with mock.patch("falcon_pipeline_realtime_service.decode_rle_mask") as decode:
+            response = client.get("/api/frame.jpg")
+
+        self.assertEqual(response.status_code, 200)
+        decode.assert_not_called()
+        self.assertIn("request_handler_ms", service.get_state()["metrics"])
+
+    def test_display_loop_rasterizes_sam3_masks_once_per_result(self) -> None:
+        service = self.make_service(source_url="https://www.youtube.com/watch?v=example", load_rtdetr=True, load_sam3=True)
+        self.mark_models_loaded(service)
+        service.session.display_max_fps = 60.0
+        service._set_metric("capture_state", "running")
+        service._set_metric("pipeline_state", "running")
+        service._set_metric("sam3_segmentation_state", "ready")
+        mask = np.zeros((64, 64), dtype=np.uint8)
+        mask[24:40, 24:40] = 1
+        with service.lock:
+            service.latest_frame = np.zeros((64, 64, 3), dtype=np.uint8)
+            service.latest_frame_id = 1
+            service.latest_result = {
+                "primary_engine": "sam3",
+                "generation_seconds": 0.05,
+                "detections": [
+                    {
+                        "index": 0,
+                        "center": {"x": 0.5, "y": 0.5},
+                        "height": 0.25,
+                        "width": 0.25,
+                        "has_mask": True,
+                        "engine": "sam3",
+                        "label": "person",
+                    }
+                ],
+                "bboxes": [{"x": 0.5, "y": 0.5, "w": 0.25, "h": 0.25}],
+                "masks_rle": [{"counts": "mock", "size": [64, 64]}],
+                "num_masks": 1,
+                "engines": [
+                    {"name": "falcon", "enabled": True, "status": "ok", "reason": None},
+                    {"name": "rt_detr", "enabled": True, "status": "ok", "reason": None},
+                    {"name": "sam3", "enabled": True, "status": "ok", "reason": None, "num_masks": 1},
+                ],
+                "scene_annotations": {
+                    "profile": "restaurant_service",
+                    "counts": {"needs_service": 1},
+                    "entities": [
+                        {
+                            "kind": "person",
+                            "role": "restaurant_goer",
+                            "needs_service": True,
+                            "bbox": {"x": 0.5, "y": 0.5, "w": 0.25, "h": 0.25},
+                        }
+                    ],
+                },
+            }
+
+        with (
+            mock.patch("falcon_pipeline_realtime_service.decode_rle_mask", return_value=mask) as decode,
+            mock.patch("falcon_pipeline_realtime_service.render_visualization") as render,
+        ):
+            render.return_value = Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8))
+            thread = threading.Thread(target=service._display_loop, daemon=True)
+            thread.start()
+            self.assertTrue(self.wait_until(lambda: len(service.display_timestamps) >= 1))
+            for frame_id in (2, 3, 4):
+                with service.lock:
+                    service.latest_frame = np.full((64, 64, 3), frame_id, dtype=np.uint8)
+                    service.latest_frame_id = frame_id
+                self.assertTrue(self.wait_until(lambda frame_id=frame_id: service.latest_overlay_frame_id == frame_id))
+            service.shutdown()
+            thread.join(timeout=1.0)
+
+        self.assertEqual(decode.call_count, 1)
+        state = service.get_state()
+        self.assertEqual(state["metrics"]["mask_rasterize_ms"], 0.0)
+        self.assertIn("cached_jpeg_age_seconds", state["metrics"])
+
     def test_display_loop_keeps_cached_sam3_visible_while_segmenting(self) -> None:
         service = self.make_service(source_url="https://www.youtube.com/watch?v=example", load_rtdetr=True, load_sam3=True)
         self.mark_models_loaded(service)
@@ -493,6 +575,14 @@ class RealtimeServiceTests(unittest.TestCase):
             "overlay_render_ms",
             "jpeg_encode_ms",
             "frame_response_ms",
+            "request_handler_ms",
+            "overlay_snapshot_lock_ms",
+            "mask_prepare_ms",
+            "mask_rasterize_ms",
+            "frame_composite_ms",
+            "annotation_draw_ms",
+            "overlay_total_ms",
+            "cached_jpeg_age_seconds",
             "gpu_utilization_percent",
             "gpu_memory_used_mb",
         ):
@@ -505,13 +595,12 @@ class RealtimeServiceTests(unittest.TestCase):
         self.assertIn("masks_rle", debug_state["result"])
         self.assertIn("masks_rle", debug_state["result"]["engine_outputs"]["sam3"])
 
-    def test_render_overlay_never_sends_detection_boxes_to_visualizer(self) -> None:
+    def test_render_overlay_never_uses_box_visualizer_for_detection_boxes(self) -> None:
         service = self.make_service(source_url="https://www.youtube.com/watch?v=example")
         frame = np.zeros((160, 160, 3), dtype=np.uint8)
 
         with mock.patch("falcon_pipeline_realtime_service.render_visualization") as render:
-            render.return_value = Image.fromarray(np.zeros((160, 160, 3), dtype=np.uint8))
-            service._render_overlay(
+            overlay = service._render_overlay(
                 frame,
                 {
                     "primary_engine": "rt_detr",
@@ -522,7 +611,8 @@ class RealtimeServiceTests(unittest.TestCase):
                 service.session,
             )
 
-        self.assertEqual(render.call_args.args[1], [])
+        render.assert_not_called()
+        self.assertEqual(overlay.shape, frame.shape)
 
     def test_render_overlay_uses_role_colored_masks_without_entity_rectangles(self) -> None:
         service = self.make_service(source_url="https://www.youtube.com/watch?v=example")

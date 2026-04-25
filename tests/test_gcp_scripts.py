@@ -54,6 +54,27 @@ class GcpScriptContractTests(unittest.TestCase):
         self.assertIn("BUILD_RUNNING", script)
         self.assertIn("IMAGE_READY", script)
 
+    def test_measure_realtime_fps_reports_visual_path_metrics(self) -> None:
+        script = self.read_script("scripts/gcp/measure_realtime_fps.py")
+
+        for expected in (
+            "observed_frame_response_fps",
+            "frame_response_ms",
+            "display_frame_fps",
+            "overlay_render_ms",
+            "overlay_snapshot_lock_ms",
+            "mask_prepare_ms",
+            "mask_rasterize_ms",
+            "frame_composite_ms",
+            "annotation_draw_ms",
+            "overlay_total_ms",
+            "cached_jpeg_age_seconds",
+            "request_handler_ms",
+            "gpu_utilization_percent",
+            "gpu_memory_used_mb",
+        ):
+            self.assertIn(expected, script)
+
 
 if __name__ == "__main__":
     unittest.main()
